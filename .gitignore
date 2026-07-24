@@ -1,0 +1,15 @@
+# Build outputs (rebuild via the commands in README.md)
+*.exe
+*.dll
+*.o
+*.obj
+
+# Recordings and run-time logs/diagnostics
+apfpv_rec_*.ts
+watchdog_log*.txt
+memory_timeline*.txt
+monitor_pid.txt
+rebuild_log*.txt
+isolate_err.txt
+player_*.txt
+watch_*.txt
