@@ -15,9 +15,15 @@ extern "C" {
 }
 #include <SDL.h>
 #include <SDL_ttf.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#include <linux/limits.h>
+#endif
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <chrono>
 #include <thread>
@@ -27,6 +33,23 @@ extern "C" {
 #include <atomic>
 #include <memory>
 #include <vector>
+
+#ifdef _WIN32
+  #define APFPV_PATH_SEP       "\\"
+  #define APFPV_HWACCEL_TYPE   AV_HWDEVICE_TYPE_D3D11VA
+  #define APFPV_HWACCEL_PIXFMT AV_PIX_FMT_D3D11
+  #define APFPV_HWACCEL_NAME   "D3D11VA"
+#else
+  #define APFPV_PATH_SEP       "/"
+  // VAAPI is the Linux equivalent of D3D11VA -- Intel/AMD GPU-backed decode
+  // via the same generic FFmpeg hwaccel API, no vendor-specific code needed
+  // here. (Not Rockchip MPP: that's tied to specific ARM SoC silicon that
+  // simply doesn't exist on an x86_64 desktop -- a different chip, not a
+  // library path to swap.)
+  #define APFPV_HWACCEL_TYPE   AV_HWDEVICE_TYPE_VAAPI
+  #define APFPV_HWACCEL_PIXFMT AV_PIX_FMT_VAAPI
+  #define APFPV_HWACCEL_NAME   "VAAPI"
+#endif
 
 // Sustained-corruption recovery: FFmpeg's own HEVC decoder logs "Could not
 // find ref", "PPS id out of range", "Error constructing the frame RPS" etc.
@@ -154,9 +177,8 @@ static std::atomic<int> g_step{ STEP_LOOP_TOP };
 static std::atomic<long long> g_frameCounter{ 0 };
 #define STEP(x) g_step.store(x, std::memory_order_relaxed)
 
-static void watchdogThread(const std::wstring& logPathW)
+static void watchdogThread(const std::string& logPath)
 {
-    std::string logPath(logPathW.begin(), logPathW.end());
     FILE* f = fopen(logPath.c_str(), "w");
     if (!f) return;
     auto start = std::chrono::steady_clock::now();
@@ -213,12 +235,18 @@ struct RecordState {
 
 static std::vector<std::thread> g_writerThreads;
 
-static std::wstring exeDir()
+static std::string exeDir()
 {
-    wchar_t buf[MAX_PATH];
-    GetModuleFileNameW(NULL, buf, MAX_PATH);
-    std::wstring s(buf);
-    return s.substr(0, s.find_last_of(L"\\/"));
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    GetModuleFileNameA(NULL, buf, MAX_PATH);
+    std::string s(buf);
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    std::string s(buf, n > 0 ? (size_t)n : 0);
+#endif
+    return s.substr(0, s.find_last_of("\\/"));
 }
 
 // Records by muxing the SAME compressed packets we're already receiving/
@@ -233,16 +261,22 @@ static std::wstring exeDir()
 // `ffmpeg -c copy` converts that automatically via an implicit bitstream
 // filter; writing Annex-B packets into an MP4 muxer ourselves without that
 // filter would produce an invalid file. TS sidesteps the whole conversion.
-static void startRecording(RecordState& rs, const std::wstring& dir, AVFormatContext* inFmt, int videoStreamIdx)
+static void startRecording(RecordState& rs, const std::string& dir, AVFormatContext* inFmt, int videoStreamIdx)
 {
     if (rs.recording) return;
 
-    SYSTEMTIME st; GetLocalTime(&st);
-    wchar_t fname[64];
-    swprintf(fname, 64, L"apfpv_rec_%04d%02d%02d_%02d%02d%02d.ts",
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    std::wstring outPathW = dir + L"\\" + fname;
-    std::string outPath(outPathW.begin(), outPathW.end());
+    time_t now = time(nullptr);
+    struct tm tmBuf;
+#ifdef _WIN32
+    localtime_s(&tmBuf, &now);
+#else
+    localtime_r(&now, &tmBuf);
+#endif
+    char fname[64];
+    snprintf(fname, sizeof(fname), "apfpv_rec_%04d%02d%02d_%02d%02d%02d.ts",
+             tmBuf.tm_year + 1900, tmBuf.tm_mon + 1, tmBuf.tm_mday,
+             tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec);
+    std::string outPath = dir + APFPV_PATH_SEP + fname;
 
     auto session = std::make_shared<RecordingSession>();
 
@@ -298,7 +332,7 @@ static void startRecording(RecordState& rs, const std::wstring& dir, AVFormatCon
         avformat_free_context(session->outFmt);
     }).detach();
 
-    wprintf(L"Recording -> %ls\n", outPathW.c_str());
+    printf("Recording -> %s\n", outPath.c_str());
     fflush(stdout);
 }
 
@@ -389,7 +423,7 @@ static AVCodecContext* createDecoder(const AVCodec* codec, AVCodecParameters* pa
         c->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
         c->get_format = [](AVCodecContext*, const AVPixelFormat* fmts) -> AVPixelFormat {
             for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; p++)
-                if (*p == AV_PIX_FMT_D3D11) return *p;
+                if (*p == APFPV_HWACCEL_PIXFMT) return *p;
             return fmts[0];
         };
     }
@@ -405,8 +439,14 @@ static AVCodecContext* createDecoder(const AVCodec* codec, AVCodecParameters* pa
 static TTF_Font* openFont(int size)
 {
     const char* candidates[] = {
+#ifdef _WIN32
         "C:\\Windows\\Fonts\\consola.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+#endif
     };
     for (auto p : candidates) {
         TTF_Font* f = TTF_OpenFont(p, size);
@@ -429,18 +469,24 @@ static void drawText(SDL_Renderer* ren, TTF_Font* font, const char* text, int x,
 
 int main(int argc, char** argv)
 {
-    std::wstring dir = exeDir();
-    std::wstring sdpPathW = dir + L"\\apfpv_h265.sdp";
-    std::string sdpPath(sdpPathW.begin(), sdpPathW.end());
+    std::string dir = exeDir();
+    std::string sdpPath = dir + APFPV_PATH_SEP + "apfpv_h265.sdp";
 
     // Unique filename per run: a restart after a crash must not overwrite the
     // previous run's watchdog log before it can be read.
     {
-        SYSTEMTIME st; GetLocalTime(&st);
-        wchar_t wname[64];
-        swprintf(wname, 64, L"watchdog_log_%04d%02d%02d_%02d%02d%02d.txt",
-                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-        std::thread(watchdogThread, dir + L"\\" + wname).detach();
+        time_t now = time(nullptr);
+        struct tm tmBuf;
+#ifdef _WIN32
+        localtime_s(&tmBuf, &now);
+#else
+        localtime_r(&now, &tmBuf);
+#endif
+        char wname[64];
+        snprintf(wname, sizeof(wname), "watchdog_log_%04d%02d%02d_%02d%02d%02d.txt",
+                 tmBuf.tm_year + 1900, tmBuf.tm_mon + 1, tmBuf.tm_mday,
+                 tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec);
+        std::thread(watchdogThread, dir + APFPV_PATH_SEP + wname).detach();
     }
 
     av_log_set_callback(ffmpegLogCallback);
@@ -472,9 +518,9 @@ int main(int argc, char** argv)
     // later decoder recreation -- only the decode SESSION gets torn down/rebuilt.
     AVBufferRef* hwDeviceCtx = nullptr;
     bool hwOk = !getenv("APFPV_NO_HWACCEL")
-             && av_hwdevice_ctx_create(&hwDeviceCtx, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) >= 0;
-    if (hwOk) printf("Using D3D11VA hardware decode.\n");
-    else      fprintf(stderr, "D3D11VA hw device unavailable, falling back to software decode.\n");
+             && av_hwdevice_ctx_create(&hwDeviceCtx, APFPV_HWACCEL_TYPE, nullptr, nullptr, 0) >= 0;
+    if (hwOk) printf("Using %s hardware decode.\n", APFPV_HWACCEL_NAME);
+    else      fprintf(stderr, "%s hw device unavailable, falling back to software decode.\n", APFPV_HWACCEL_NAME);
 
     AVCodecContext* ctx = createDecoder(codec, par, hwDeviceCtx, hwOk);
     if (!ctx) { fprintf(stderr, "Failed to open decoder\n"); return 1; }
@@ -493,7 +539,7 @@ int main(int argc, char** argv)
 
     SwsContext* sws = nullptr;
     AVFrame* frame = av_frame_alloc();
-    AVFrame* hwSwFrame = av_frame_alloc();   // D3D11 frame transferred to CPU memory
+    AVFrame* hwSwFrame = av_frame_alloc();   // hwaccel frame transferred to CPU memory
     AVFrame* frameYuv = av_frame_alloc();
     AVPacket* pkt = av_packet_alloc();
 
@@ -546,11 +592,12 @@ int main(int argc, char** argv)
                 if (avcodec_send_packet(ctx, pkt) == 0) {
                     STEP(STEP_RECEIVE_FRAME);
                     while (avcodec_receive_frame(ctx, frame) == 0) {
-                        // D3D11VA hands back a GPU-resident frame (format == AV_PIX_FMT_D3D11);
-                        // pull it into normal CPU memory (usually NV12) so the existing
-                        // sws_scale/SDL path below can use it unchanged.
+                        // The hwaccel hands back a GPU-resident frame (format ==
+                        // APFPV_HWACCEL_PIXFMT); pull it into normal CPU memory
+                        // (usually NV12) so the existing sws_scale/SDL path below
+                        // can use it unchanged.
                         AVFrame* useFrame = frame;
-                        if (frame->format == AV_PIX_FMT_D3D11) {
+                        if (frame->format == APFPV_HWACCEL_PIXFMT) {
                             STEP(STEP_HW_TRANSFER);
                             av_frame_unref(hwSwFrame);
                             if (av_hwframe_transfer_data(hwSwFrame, frame, 0) < 0) {

@@ -5,9 +5,9 @@
 // which talks the exact UDP protocol aalink on the VTX expects
 // (192.168.0.1:12345, "gs_string=gs rssi_a = NN(%)").
 //
-// Build (MinGW64): g++ -std=c++17 -O2 -I../src lqfeedback_cli.cpp ../src/LqFeedback.cpp -lwlanapi -lws2_32 -o lqfeedback_cli.exe
+// Build (MinGW64): g++ -std=c++17 -O2 lqfeedback_cli.cpp LqFeedback.cpp -lwlanapi -lws2_32 -o lqfeedback_cli.exe
 // Run: lqfeedback_cli.exe [air-ip, default 192.168.0.1]
-#include "../src/LqFeedback.h"
+#include "LqFeedback.h"
 #include <windows.h>
 #include <wlanapi.h>
 #include <cstdio>

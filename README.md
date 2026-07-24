@@ -14,6 +14,9 @@ monitor-mode dependency.
   on exit.
 - `lqfeedback_cli.cpp` -- sends live RSSI (read via the Windows WLAN API,
   `wlanapi.h`) to the VTX's aalink link-quality service as UDP feedback.
+- `LqFeedback.h`/`.cpp` -- the shared UDP sender (already cross-platform:
+  `#ifdef _WIN32`/POSIX socket guards), flattened in here so this repo builds
+  standalone with no path outside it.
 
 ## Build (MSYS2 MinGW64 shell)
 
@@ -26,7 +29,7 @@ g++ -std=c++17 -O2 apfpv_player.cpp -o apfpv_player.exe \
 g++ -std=c++17 -O2 apfpv_watch.cpp -o apfpv_watch.exe -mconsole
 
 g++ -std=c++17 -O2 -static -static-libgcc -static-libstdc++ \
-  lqfeedback_cli.cpp -o lqfeedback_cli.exe -lws2_32 -lwlanapi -lole32
+  lqfeedback_cli.cpp LqFeedback.cpp -o lqfeedback_cli.exe -lws2_32 -lwlanapi -lole32
 ```
 
 Then copy the required MinGW64 runtime DLLs next to the exes (`ldd
