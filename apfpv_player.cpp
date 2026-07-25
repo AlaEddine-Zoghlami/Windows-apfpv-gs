@@ -22,9 +22,11 @@ extern "C" {
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wlanapi.h>
 #else
 #include <unistd.h>
 #include <linux/limits.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -373,9 +375,19 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
     // back a hardware encoder (nvenc/amf/mf) that then fails avcodec_open2 on a machine without
     // the matching GPU. libx264/libx265 are always available in this build (verified separately).
     bool isHevc = inFmt->streams[vs]->codecpar->codec_id == AV_CODEC_ID_HEVC;
-    const AVCodec* enc = avcodec_find_encoder_by_name(isHevc ? "libx265" : "libx264");
+    // Prefer a GPU encoder. Measured on this machine at 1080p: hevc_amf ~153 fps vs libx265
+    // ~31 fps. Against 90 fps footage that is the difference between finishing FASTER than
+    // realtime and taking ~3x the clip length -- the latter is why a re-encode in practice never
+    // completed before the app was closed. Software remains the fallback.
+    const char* cands[3];
+    if (isHevc) { cands[0] = "hevc_amf"; cands[1] = "hevc_nvenc"; cands[2] = "libx265"; }
+    else        { cands[0] = "h264_amf"; cands[1] = "h264_nvenc"; cands[2] = "libx264"; }
+    const AVCodec* enc = nullptr; const char* encName = nullptr;
+    for (int ci = 0; ci < 3 && !enc; ci++) {
+        if (const AVCodec* c = avcodec_find_encoder_by_name(cands[ci])) { enc = c; encName = cands[ci]; }
+    }
     if (!enc) {
-        fprintf(stderr, "Overshoot Fix re-encode: no %s encoder available\n", isHevc ? "libx265" : "libx264");
+        fprintf(stderr, "Overshoot Fix re-encode: no usable %s encoder\n", isHevc ? "HEVC" : "H.264");
         cleanup(); return;
     }
     encCtx = avcodec_alloc_context3(enc);
@@ -395,7 +407,11 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
     encCtx->color_primaries = decCtx->color_primaries;
     encCtx->color_trc       = decCtx->color_trc;
     encCtx->colorspace      = decCtx->colorspace;
-    av_opt_set(encCtx->priv_data, "preset", "veryfast", 0);
+    // "preset" is an x264/x265 private option; AMF/NVENC name theirs differently, so only apply
+    // it when we actually selected a software encoder.
+    if (encName && strncmp(encName, "lib", 3) == 0)
+        av_opt_set(encCtx->priv_data, "preset", "veryfast", 0);
+    fprintf(stderr, "Overshoot Fix re-encode: encoder=%s\n", encName ? encName : "?");
 
     if (avformat_alloc_output_context2(&outFmt, nullptr, "mpegts", tmpPath.c_str()) < 0 || !outFmt) {
         fprintf(stderr, "Overshoot Fix re-encode: failed to allocate output for %s\n", tmpPath.c_str());
@@ -403,7 +419,7 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
     }
     if (outFmt->oformat->flags & AVFMT_GLOBALHEADER) encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (avcodec_open2(encCtx, enc, nullptr) < 0) {
-        fprintf(stderr, "Overshoot Fix re-encode: failed to open %s encoder\n", isHevc ? "libx265" : "libx264");
+        fprintf(stderr, "Overshoot Fix re-encode: failed to open encoder %s\n", encName ? encName : "?");
         cleanup(); return;
     }
     outStream = avformat_new_stream(outFmt, nullptr);
@@ -464,7 +480,23 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
         }
     };
 
+    // Progress output matters here: this pass runs SLOWER than realtime (~2.4x on this machine --
+    // software HEVC decode plus the per-pixel LUT dominate, not the encoder), and the writer
+    // thread is joined at process exit, so without this a closing app looks like it has hung.
+    long long reencT0 = nowMs();
+    int lastPct = -10;
+    int64_t totalDurUs = inFmt->duration > 0 ? inFmt->duration : 0;
     while (av_read_frame(inFmt, pkt) >= 0) {
+        if (totalDurUs > 0 && pkt->pts != AV_NOPTS_VALUE) {
+            int64_t ptsUs = av_rescale_q(pkt->pts, inFmt->streams[vs]->time_base, AVRational{ 1, 1000000 });
+            int pct = (int)(ptsUs * 100 / totalDurUs);
+            if (pct >= lastPct + 10 && pct <= 100) {
+                lastPct = pct;
+                fprintf(stderr, "Overshoot Fix re-encode: %d%% (%.1fs elapsed)\n",
+                        pct, (double)(nowMs() - reencT0) / 1000.0);
+                fflush(stderr);
+            }
+        }
         if (pkt->stream_index == vs) {
             int sendErr = avcodec_send_packet(decCtx, pkt);
             if (sendErr < 0) {
@@ -569,7 +601,18 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
     snprintf(fname, sizeof(fname), "apfpv_rec_%04d%02d%02d_%02d%02d%02d.ts",
              tmBuf.tm_year + 1900, tmBuf.tm_mon + 1, tmBuf.tm_mday,
              tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec);
-    std::string outPath = dir + APFPV_PATH_SEP + fname;
+    // Recordings live in a "records" subfolder so they stop cluttering the exe directory (which
+    // also holds the SDP, fonts and logs). Created on demand; if creation fails we fall back to
+    // the exe directory rather than losing the recording.
+    std::string recDir = dir + APFPV_PATH_SEP + "records";
+#ifdef _WIN32
+    CreateDirectoryA(recDir.c_str(), nullptr);
+    bool haveDir = (GetFileAttributesA(recDir.c_str()) != INVALID_FILE_ATTRIBUTES);
+#else
+    mkdir(recDir.c_str(), 0755);
+    bool haveDir = true;
+#endif
+    std::string outPath = (haveDir ? recDir : dir) + APFPV_PATH_SEP + fname;
 
     auto session = std::make_shared<RecordingSession>();
 
@@ -629,7 +672,10 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
             lut.build(2.5f, -0.15f);
             reencodeWithOvershootFix(session->outPath, lut);
         }
-    }).detach();
+    });   // Deliberately NOT detached -- see the comment on g_writerThreads above. Detaching made
+          // joinable() false, so the join loop at shutdown did nothing and the OS killed this
+          // thread on exit, cutting off the Overshoot Fix re-encode before it replaced the file.
+          // That is why the fix never appeared in recordings.
 
     printf("Recording -> %s\n", outPath.c_str());
     fflush(stdout);
@@ -922,6 +968,86 @@ static bool decodeImageRGBA(const char* path, std::vector<uint8_t>& out, int& W,
     return ok;
 }
 
+// Link stats for the on-screen status line, replacing what the VTX used to burn in via aalink.
+// Everything here is measured AT THE RECEIVER, which is strictly more truthful than the old
+// burned-in line for the down-link direction: it is the same RSSI->percent value we feed back to
+// aalink (LqFeedback::rssiPct == the OpenIPC gs mapping 2*(dBm+100), clamped).
+//
+// Two honest limits:
+//  - The Windows WLAN API exposes the PHY RATE, not an MCS index. Back-deriving an index needs the
+//    bandwidth+guard-interval combination and would be a guess, so the real rate is shown instead.
+//  - "up%" is aalink's OWN VTX-side RSSI measurement. It does not exist on the ground, so it stays
+//    "--" until it is forwarded (aalink can emit it with EXTERNAL_OSD=1 -> /tmp/aalink_ext.msg).
+struct LinkStats {
+#ifdef _WIN32
+    HANDLE h = nullptr;
+    GUID guid{};
+    bool haveIface = false;
+#endif
+    int  rssiDbm = 0;          // 0 = unknown
+    unsigned rxRateKbps = 0;   // PHY rate reported by the driver
+    long long bytesTotal = 0;  // cumulative received payload
+    double mbps = 0.0;         // rolling receive rate
+    long long winBytes = 0, winStartMs = 0;
+
+    void init() {
+#ifdef _WIN32
+        DWORD neg = 0;
+        if (WlanOpenHandle(2, nullptr, &neg, &h) != ERROR_SUCCESS) { h = nullptr; return; }
+        WLAN_INTERFACE_INFO_LIST* list = nullptr;
+        if (WlanEnumInterfaces(h, nullptr, &list) == ERROR_SUCCESS && list) {
+            // Prefer the USB adapter (the FPV dongle) exactly like lqfeedback_cli does; fall back
+            // to the first interface so this still works on a built-in radio.
+            for (DWORD i = 0; i < list->dwNumberOfItems; i++) {
+                char desc[256] = {0};
+                WideCharToMultiByte(CP_UTF8, 0, list->InterfaceInfo[i].strInterfaceDescription, -1,
+                                    desc, sizeof(desc), nullptr, nullptr);
+                if (strstr(desc, "USB")) { guid = list->InterfaceInfo[i].InterfaceGuid; haveIface = true; break; }
+            }
+            if (!haveIface && list->dwNumberOfItems > 0) { guid = list->InterfaceInfo[0].InterfaceGuid; haveIface = true; }
+            WlanFreeMemory(list);
+        }
+#endif
+    }
+
+    void addBytes(int n) { bytesTotal += n; winBytes += n; }
+
+    // Poll ~1 Hz: refresh the rolling bitrate and the driver-reported RSSI / PHY rate.
+    void tick(long long nowMsV) {
+        if (winStartMs == 0) { winStartMs = nowMsV; winBytes = 0; return; }
+        long long dt = nowMsV - winStartMs;
+        if (dt < 1000) return;
+        mbps = (double)winBytes * 8.0 / (double)dt / 1000.0;   // bytes/ms -> Mbit/s
+        winBytes = 0; winStartMs = nowMsV;
+#ifdef _WIN32
+        if (!h || !haveIface) return;
+        DWORD sz = 0; PVOID data = nullptr;
+        if (WlanQueryInterface(h, &guid, wlan_intf_opcode_rssi, nullptr, &sz, &data, nullptr) == ERROR_SUCCESS && data) {
+            rssiDbm = (int)*(LONG*)data; WlanFreeMemory(data);
+        }
+        sz = 0; data = nullptr;
+        if (WlanQueryInterface(h, &guid, wlan_intf_opcode_current_connection, nullptr, &sz, &data, nullptr) == ERROR_SUCCESS && data) {
+            auto* ca = (WLAN_CONNECTION_ATTRIBUTES*)data;
+            rxRateKbps = ca->wlanAssociationAttributes.ulRxRate;
+            WlanFreeMemory(data);
+        }
+#endif
+    }
+
+    // Same mapping LqFeedback uses, so the number shown is exactly what aalink is being told.
+    int downPct() const {
+        if (rssiDbm == 0) return -1;
+        int p = 2 * (rssiDbm + 100);
+        return p < 0 ? 0 : (p > 100 ? 100 : p);
+    }
+
+    void close() {
+#ifdef _WIN32
+        if (h) { WlanCloseHandle(h, nullptr); h = nullptr; }
+#endif
+    }
+};
+
 // Ground-side OSD: rasterises the MSP_DISPLAYPORT canvas into a cached texture. Rebuilt only
 // when the canvas generation changes (~10 Hz) rather than per video frame (90 Hz), so the
 // per-frame cost is a single textured quad.
@@ -1099,6 +1225,8 @@ int main(int argc, char** argv)
     // Start the MSP listener unconditionally: the same stream drives BOTH the ground-side OSD and
     // arm detection, and the OSD should work whether or not auto-record is enabled.
     msp.start();
+    LinkStats link;
+    link.init();
     OsdRenderer osdR;
     bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts" + APFPV_PATH_SEP + "font_btfl.png");
     SDL_Rect osdBtn{ 12, 180, 160, 60 };
@@ -1198,6 +1326,7 @@ int main(int argc, char** argv)
         }
         if (rc >= 0) {
             ioNotedProgress();
+            link.addBytes(pkt->size);
             if (pkt->stream_index == videoStream && waitingForKeyframe && (pkt->flags & AV_PKT_FLAG_KEY)) {
                 waitingForKeyframe = false;
                 fprintf(stderr, "Resync: keyframe arrived, resuming decode.\n");
@@ -1398,8 +1527,23 @@ int main(int argc, char** argv)
         }
 
         STEP(STEP_DRAW_TEXT);
-        char statLine[64];
-        snprintf(statLine, sizeof(statLine), "%dx%d  %.1f fps", texW, texH, fps);
+        link.tick(nowMs());
+        char statLine[192];
+        {
+            int dn = link.downPct();
+            char dnBuf[16]; if (dn < 0) snprintf(dnBuf, sizeof(dnBuf), "--"); else snprintf(dnBuf, sizeof(dnBuf), "%d%%", dn);
+            char rateBuf[24];
+            if (link.rxRateKbps) snprintf(rateBuf, sizeof(rateBuf), "%u", link.rxRateKbps / 1000);
+            else                 snprintf(rateBuf, sizeof(rateBuf), "--");
+            double gb = (double)link.bytesTotal / (1024.0 * 1024.0 * 1024.0);
+            char sentBuf[24];
+            if (gb >= 1.0) snprintf(sentBuf, sizeof(sentBuf), "%.2fGB", gb);
+            else           snprintf(sentBuf, sizeof(sentBuf), "%.0fMB", (double)link.bytesTotal / (1024.0 * 1024.0));
+            // Mirrors the old VTX line's fields, but every number here is measured at the receiver.
+            snprintf(statLine, sizeof(statLine),
+                     "%dx%d %.1ffps | %.1fMbps | %s | link:%sM | up:-- dn:%s",
+                     texW, texH, fps, link.mbps, sentBuf, rateBuf, dnBuf);
+        }
         drawTextCached(ren, font, statLineText, statLine, 12, 10, SDL_Color{ 255, 255, 255, 255 });
 
         STEP(STEP_DRAW_BUTTON);
@@ -1446,6 +1590,7 @@ int main(int argc, char** argv)
         }
     }
 
+    link.close();
     osdR.destroy();
     msp.stop();   // join the MSP listener before we start tearing down
     stopRecording(rec, overshootFixEnabled);   // signals any still-active session to stop
