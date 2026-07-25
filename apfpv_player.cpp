@@ -125,13 +125,42 @@ static AVFormatContext* openInput(const std::string& sdpPath, int& videoStreamOu
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "protocol_whitelist", "file,rtp,udp", 0);
     av_dict_set(&opts, "timeout", "2000000", 0);
+    // Absorb bursty Wi-Fi delivery (A-MPDU aggregation hands the OS many RTP
+    // packets in a tight cluster, not evenly spaced) instead of dropping them
+    // outright when a receive buffer fills or the jitter window is too tight
+    // -- both of these are consumed as demuxer-level options by the SDP/RTP
+    // demuxer that owns the per-stream sockets it's about to open, not
+    // protocol-level options threaded through to an already-open nested
+    // AVIOContext (that's the "timeout" propagation failure noted above), so
+    // they're expected to actually take effect here.
+    av_dict_set(&opts, "reorder_queue_size", "500", 0);   // packets held for RTP reordering (default lower)
+    av_dict_set(&opts, "buffer_size", "4194304", 0);      // 4MB UDP socket recv buffer (OS default is far smaller)
 
     AVFormatContext* fmt = avformat_alloc_context();
     fmt->interrupt_callback.callback = ioInterruptCallback;
     fmt->interrupt_callback.opaque = nullptr;
+    // Set directly on the struct (read by rtpdec's own jitter buffer as
+    // ic->max_delay) rather than only via the AVDictionary above -- this field
+    // is guaranteed to reach the demuxer since it's the SAME AVFormatContext
+    // instance, sidestepping any nested-context propagation question entirely.
+    // Default ~0.5s was tight enough that real jitter regularly hit it
+    // ("max delay reached. need to consume packet" in the logs) and force-fed
+    // the decoder out-of-order/incomplete data instead of waiting the extra
+    // moment for the missing packet to actually arrive.
+    fmt->max_delay = 1000000;   // 1s, up from the ~500ms default
     ioNotedProgress();
 
     int rc = avformat_open_input(&fmt, sdpPath.c_str(), nullptr, &opts);
+    // Anything still IN opts after open wasn't recognized/consumed by this
+    // demuxer/protocol -- e.g. if reorder_queue_size/buffer_size above turn
+    // out not to apply here the way max_delay's direct struct field does,
+    // this is how to actually tell instead of silently assuming they worked.
+    if (av_dict_count(opts) > 0) {
+        const AVDictionaryEntry* e = nullptr;
+        while ((e = av_dict_get(opts, "", e, AV_DICT_IGNORE_SUFFIX)))
+            fprintf(stderr, "openInput: option not consumed by demuxer: %s=%s\n", e->key, e->value);
+        fflush(stderr);
+    }
     av_dict_free(&opts);
     if (rc < 0) return nullptr;   // avformat_open_input frees fmt itself on failure
 
@@ -455,16 +484,36 @@ static TTF_Font* openFont(int size)
     return nullptr;
 }
 
-static void drawText(SDL_Renderer* ren, TTF_Font* font, const char* text, int x, int y, SDL_Color color)
+// Caches the rendered texture across calls and only redoes the (CPU-side glyph
+// render + GPU texture upload) work when the string actually changes. The two
+// callers redraw every render-loop iteration (i.e. at the VIDEO frame rate,
+// 60-120fps) but their text only actually changes once a second (the FPS/res
+// line) or on REC toggle -- doing the full TTF_RenderText_Blended +
+// SDL_CreateTextureFromSurface + SDL_DestroyTexture cycle unconditionally on
+// every frame was measurable, avoidable per-frame CPU/GPU work sitting
+// directly in the same loop that must keep up with incoming RTP packets to
+// avoid the OS socket buffer overflowing under a burst.
+struct CachedText {
+    SDL_Texture* tex = nullptr;
+    int w = 0, h = 0;
+    std::string last;
+};
+static void drawTextCached(SDL_Renderer* ren, TTF_Font* font, CachedText& cache,
+                           const std::string& text, int x, int y, SDL_Color color)
 {
     if (!font) return;
-    SDL_Surface* surf = TTF_RenderText_Blended(font, text, color);
-    if (!surf) return;
-    SDL_Texture* tex = SDL_CreateTextureFromSurface(ren, surf);
-    SDL_Rect dst{ x, y, surf->w, surf->h };
-    SDL_RenderCopy(ren, tex, NULL, &dst);
-    SDL_DestroyTexture(tex);
-    SDL_FreeSurface(surf);
+    if (!cache.tex || text != cache.last) {
+        if (cache.tex) { SDL_DestroyTexture(cache.tex); cache.tex = nullptr; }
+        SDL_Surface* surf = TTF_RenderText_Blended(font, text.c_str(), color);
+        if (!surf) return;
+        cache.tex = SDL_CreateTextureFromSurface(ren, surf);
+        cache.w = surf->w; cache.h = surf->h;
+        SDL_FreeSurface(surf);
+        cache.last = text;
+    }
+    if (!cache.tex) return;
+    SDL_Rect dst{ x, y, cache.w, cache.h };
+    SDL_RenderCopy(ren, cache.tex, NULL, &dst);
 }
 
 int main(int argc, char** argv)
@@ -546,6 +595,7 @@ int main(int argc, char** argv)
     // REC button geometry (top-left, below the FPS/res text line) -- sized
     // generously (a first attempt at 90x34 was missed in testing).
     SDL_Rect recBtn{ 12, 44, 160, 60 };
+    CachedText statLineText, recBtnText;
 
     RecordState rec;
     bool running = true;
@@ -780,15 +830,15 @@ int main(int argc, char** argv)
         STEP(STEP_DRAW_TEXT);
         char statLine[64];
         snprintf(statLine, sizeof(statLine), "%dx%d  %.1f fps", texW, texH, fps);
-        drawText(ren, font, statLine, 12, 10, SDL_Color{ 255, 255, 255, 255 });
+        drawTextCached(ren, font, statLineText, statLine, 12, 10, SDL_Color{ 255, 255, 255, 255 });
 
         STEP(STEP_DRAW_BUTTON);
         SDL_SetRenderDrawColor(ren, rec.recording ? 200 : 60, rec.recording ? 30 : 60, 30, 220);
         SDL_RenderFillRect(ren, &recBtn);
         SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
         SDL_RenderDrawRect(ren, &recBtn);
-        drawText(ren, font, rec.recording ? "REC ||" : "REC", recBtn.x + 20, recBtn.y + 18,
-                 SDL_Color{ 255, 255, 255, 255 });
+        drawTextCached(ren, font, recBtnText, rec.recording ? "REC ||" : "REC", recBtn.x + 20, recBtn.y + 18,
+                       SDL_Color{ 255, 255, 255, 255 });
 
         STEP(STEP_RENDER_PRESENT);
         SDL_RenderPresent(ren);
