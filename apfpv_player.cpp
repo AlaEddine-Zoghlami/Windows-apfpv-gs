@@ -304,6 +304,20 @@ struct ColortransLut {
         }
     }
 };
+// One captured state of the ground-side OSD, stamped relative to the recording start. The OSD
+// post-pass needs to know what the overlay showed AT EACH MOMENT, and the canvas only changes at
+// ~10 Hz, so recording the changes is far cheaper than storing a per-frame overlay (~3 KB per
+// change, i.e. a few MB for a long flight).
+struct OsdSnapshot {
+    long long tMs;
+    mspospd::Cell cells[mspospd::MAX_ROWS][mspospd::MAX_COLS];
+};
+
+// The OSD composite pass runs on the writer thread after recording stops, so the atlas has to be
+// reachable from there rather than living only inside the renderer.
+static std::vector<uint8_t> g_atlasRGBA;
+static mspospd::FontAtlas   g_atlas;
+
 static void applyColortrans(AVFrame* f, const ColortransLut& lut) {
     for (int y = 0; y < f->height; y++) {
         uint8_t* row = f->data[0] + y * f->linesize[0];
@@ -323,9 +337,59 @@ static void applyColortrans(AVFrame* f, const ColortransLut& lut) {
 // re-encode, and replace the original file. Keeps the LIVE recording path exactly as fast and
 // lossless as before (still a straight packet remux, see startRecording/writeRecordingPacket) --
 // only recordings actually made with the fix on pay this one-time background re-encode cost.
-static void reencodeWithOvershootFix(const std::string& path, const ColortransLut& lut)
+// Burn the ground-side OSD into a copy of a finished recording, producing the "with OSD" file that
+// sits next to the untouched raw one. Uses the captured canvas timeline so each frame gets the
+// overlay as it looked AT THAT MOMENT rather than one frozen snapshot.
+//
+// Glyphs are blended directly in YUV: the atlas palette is effectively binary-alpha (tRNS marks a
+// single fully transparent index), so a per-pixel test is enough and no real alpha compositing is
+// needed. Colour conversion is BT.709 to match HD video.
+static void compositeOsdOnFrame(AVFrame* f, const OsdSnapshot& snap, int cols, int rows) {
+    if (!g_atlas.valid() || f->format != AV_PIX_FMT_YUV420P) return;
+    const int gw = g_atlas.glyphW, gh = g_atlas.glyphH;
+    // The canvas (53*36 = 1908) is narrower than 1920, so centre it exactly as the VTX overlay sat.
+    const int xoff = (f->width - cols * gw) / 2;
+    const int yoff = (f->height - rows * gh) / 2;
+    for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) {
+        const mspospd::Cell cell = snap.cells[r][c];
+        if (!cell.glyph) continue;
+        int sx, sy, sw, sh; g_atlas.srcRect(cell.glyph, cell.page, sx, sy, sw, sh);
+        if (sy + sh > g_atlas.h) continue;
+        for (int y = 0; y < sh; y++) {
+            int dy = yoff + r * gh + y;
+            if (dy < 0 || dy >= f->height) continue;
+            const uint8_t* srow = g_atlasRGBA.data() + ((size_t)(sy + y) * g_atlas.w + sx) * 4;
+            uint8_t* yrow = f->data[0] + (ptrdiff_t)dy * f->linesize[0];
+            for (int x = 0; x < sw; x++) {
+                if (!srow[x * 4 + 3]) continue;             // transparent atlas pixel
+                int dx = xoff + c * gw + x;
+                if (dx < 0 || dx >= f->width) continue;
+                int R = srow[x * 4 + 0], G = srow[x * 4 + 1], B = srow[x * 4 + 2];
+                int Y = (int)(0.2126 * R + 0.7152 * G + 0.0722 * B);
+                yrow[dx] = (uint8_t)(Y < 0 ? 0 : (Y > 255 ? 255 : Y));
+                // Chroma is half resolution; writing it once per 2x2 is visually identical here
+                // because glyphs are flat-coloured.
+                if ((dx & 1) == 0 && (dy & 1) == 0) {
+                    int U = (int)(-0.1146 * R - 0.3854 * G + 0.5000 * B) + 128;
+                    int V = (int)( 0.5000 * R - 0.4542 * G - 0.0458 * B) + 128;
+                    int cx = dx / 2, cy = dy / 2;
+                    if (cx < (f->width + 1) / 2 && cy < (f->height + 1) / 2) {
+                        f->data[1][(ptrdiff_t)cy * f->linesize[1] + cx] = (uint8_t)(U < 0 ? 0 : (U > 255 ? 255 : U));
+                        f->data[2][(ptrdiff_t)cy * f->linesize[2] + cx] = (uint8_t)(V < 0 ? 0 : (V > 255 ? 255 : V));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One re-encode pass serving BOTH outputs: optional colour LUT (Overshoot Fix) and optional OSD
+// burn-in. inPath == outPath means "fix in place" (the file is replaced only on success).
+static void reencodePass(const std::string& inPath, const std::string& outPath,
+                         const ColortransLut* lut, const std::vector<OsdSnapshot>* timeline)
 {
-    std::string tmpPath = path + ".fixing.ts";
+    const std::string& path = inPath;
+    std::string tmpPath = outPath + ".part.ts";
     AVFormatContext* inFmt = nullptr;
     AVFormatContext* outFmt = nullptr;
     AVCodecContext* decCtx = nullptr;
@@ -453,7 +517,7 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
             sws_scale(sws, f->data, f->linesize, 0, f->height, frameYuv->data, frameYuv->linesize);
             frameYuv->pts = f->pts;
             useFrame = frameYuv;
-            applyColortrans(useFrame, lut);            // fresh buffer: safe to transform in place
+            if (lut) applyColortrans(useFrame, *lut);   // fresh buffer: safe to transform in place
         } else {
             // FUSED COPY+LUT. The decoder hands back a refcounted/pooled frame, so it cannot be
             // written in place. The obvious av_frame_make_writable() + applyColortrans() does TWO
@@ -471,16 +535,29 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
             for (int y = 0; y < f->height; y++) {
                 const uint8_t* s = f->data[0] + (ptrdiff_t)y * f->linesize[0];
                 uint8_t* d = frameYuv->data[0] + (ptrdiff_t)y * frameYuv->linesize[0];
-                for (int x = 0; x < f->width; x++) d[x] = lut.y[s[x]];
+                if (lut) { for (int x = 0; x < f->width; x++) d[x] = lut->y[s[x]]; }
+                else      { memcpy(d, s, (size_t)f->width); }
             }
             for (int p = 1; p <= 2; p++)
                 for (int y = 0; y < ch; y++) {
                     const uint8_t* s = f->data[p] + (ptrdiff_t)y * f->linesize[p];
                     uint8_t* d = frameYuv->data[p] + (ptrdiff_t)y * frameYuv->linesize[p];
-                    for (int x = 0; x < cw; x++) d[x] = lut.c[s[x]];
+                    if (lut) { for (int x = 0; x < cw; x++) d[x] = lut->c[s[x]]; }
+                    else      { memcpy(d, s, (size_t)cw); }
                 }
             frameYuv->pts = f->pts;
             useFrame = frameYuv;
+        }
+        // Pick the canvas state in effect at this frame's presentation time.
+        if (timeline && !timeline->empty()) {
+            long long tMs = 0;
+            if (useFrame->pts != AV_NOPTS_VALUE)
+                tMs = (long long)av_rescale_q(useFrame->pts, inFmt->streams[vs]->time_base,
+                                              AVRational{ 1, 1000 });
+            size_t idx = 0;
+            while (idx + 1 < timeline->size() && (*timeline)[idx + 1].tMs <= tMs) idx++;
+            int ccols, crows; mspospd::canvasSizeFor(g_atlas.glyphW, ccols, crows);
+            compositeOsdOnFrame(useFrame, (*timeline)[idx], ccols, crows);
         }
         int sendErr = avcodec_send_frame(encCtx, useFrame);
         if (sendErr < 0) {
@@ -549,8 +626,8 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
     cleanup();
 
     if (ok) {
-        remove(path.c_str());
-        if (rename(tmpPath.c_str(), path.c_str()) == 0)
+        remove(outPath.c_str());
+        if (rename(tmpPath.c_str(), outPath.c_str()) == 0)
             fprintf(stderr, "Overshoot Fix: re-encoded recording -> %s\n", path.c_str());
         else
             fprintf(stderr, "Overshoot Fix: re-encode finished but rename to %s failed\n", path.c_str());
@@ -560,14 +637,16 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
     fflush(stderr);
 }
 
-// One captured state of the ground-side OSD, stamped relative to the recording start. The OSD
-// post-pass needs to know what the overlay showed AT EACH MOMENT, and the canvas only changes at
-// ~10 Hz, so recording the changes is far cheaper than storing a per-frame overlay (~3 KB per
-// change, i.e. a few MB for a long flight).
-struct OsdSnapshot {
-    long long tMs;
-    mspospd::Cell cells[mspospd::MAX_ROWS][mspospd::MAX_COLS];
-};
+static void reencodeWithOsd(const std::string& inPath, const std::string& outPath,
+                            const std::vector<OsdSnapshot>& timeline, const ColortransLut* lut);
+
+static void reencodeWithOvershootFix(const std::string& path, const ColortransLut& lut) {
+    reencodePass(path, path, &lut, nullptr);
+}
+static void reencodeWithOsd(const std::string& inPath, const std::string& outPath,
+                            const std::vector<OsdSnapshot>& timeline, const ColortransLut* lut) {
+    reencodePass(inPath, outPath, lut, &timeline);
+}
 
 struct RecordingSession {
     AVFormatContext* outFmt = nullptr;
@@ -676,6 +755,7 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
     }
 
     session->outPath = outPath;
+    session->startMs = nowMs();
     rs.session = session;
     rs.recording = true;
 
@@ -701,6 +781,17 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
         av_write_trailer(session->outFmt);
         avio_closep(&session->outFmt->pb);
         avformat_free_context(session->outFmt);
+        // Second output: the same footage with the OSD burned in, written alongside the raw file
+        // as <name>_osd.ts. The raw recording itself stays an untouched lossless remux -- that is
+        // the whole point of moving the OSD off the VTX, so "raw" really is raw.
+        if (session->wantOsdCopy) {
+            std::string osdOut = session->outPath;
+            size_t dot = osdOut.find_last_of('.');
+            osdOut = (dot == std::string::npos ? osdOut : osdOut.substr(0, dot)) + "_osd.ts";
+            ColortransLut lut2; lut2.build(2.5f, -0.15f);
+            reencodeWithOsd(session->outPath, osdOut, session->osdTimeline,
+                            session->applyOvershootFix ? &lut2 : nullptr);
+        }
         if (session->applyOvershootFix) {
             ColortransLut lut;
             lut.build(2.5f, -0.15f);
@@ -771,13 +862,15 @@ static void writeRecordingPacket(RecordState& rs, const AVPacket* pkt)
 // Non-blocking: hands the session off to its writer thread (which already
 // holds its own reference) and forgets it immediately. Draining the queue
 // and finalizing the file happen in the background.
-static void stopRecording(RecordState& rs, bool overshootFixEnabled)
+static void stopRecording(RecordState& rs, bool overshootFixEnabled, bool osdEnabled = false)
 {
     if (!rs.recording) return;
     {
         std::lock_guard<std::mutex> lk(rs.session->qMutex);
         rs.session->running = false;
         rs.session->applyOvershootFix = overshootFixEnabled;
+        // Only worth a second pass if the OSD was on AND we actually captured canvas states.
+        rs.session->wantOsdCopy = osdEnabled && !rs.session->osdTimeline.empty();
     }
     rs.session->qCv.notify_one();
     rs.session.reset();
@@ -1179,6 +1272,7 @@ struct OsdRenderer {
         if (!canvasTex) return false;
         SDL_SetTextureBlendMode(canvasTex, SDL_BLENDMODE_BLEND);
         ready = true;
+        g_atlasRGBA = atlasRGBA; g_atlas = mspospd::makeAtlas(g_atlasRGBA.data(), fw, fh);
         fprintf(stderr, "OSD: atlas %dx%d glyph %dx%d -> canvas %dx%d cells (%dx%d px)\n",
                 fw, fh, atlas.glyphW, atlas.glyphH, cols, rows, texW, texH);
         return true;
@@ -1226,6 +1320,32 @@ int main(int argc, char** argv)
 {
     // Dev/test-only hook: exercise reencodeWithOvershootFix directly on an existing recording,
     // no SDL/GUI/live-stream needed. Not part of the normal app flow.
+    // Dev/test-only: burn a captured OSD canvas into a clip, to verify the composite pass
+    // (geometry, glyph indexing, YUV blend) without needing a live link.
+    //   --osd-test <in.ts> <out.ts> <msp_capture.bin> <font.png>
+    if (argc >= 6 && std::string(argv[1]) == "--osd-test") {
+        int fw = 0, fh = 0;
+        if (!decodeImageRGBA(argv[5], g_atlasRGBA, fw, fh)) { fprintf(stderr, "font decode failed\n"); return 1; }
+        g_atlas = mspospd::makeAtlas(g_atlasRGBA.data(), fw, fh);
+        FILE* cf = fopen(argv[4], "rb");
+        if (!cf) { fprintf(stderr, "capture open failed\n"); return 1; }
+        std::vector<uint8_t> cap; { uint8_t b[4096]; size_t n; while ((n = fread(b, 1, sizeof(b), cf)) > 0) cap.insert(cap.end(), b, b + n); }
+        fclose(cf);
+        mspospd::Canvas cv;
+        for (size_t i = 0; i + 5 <= cap.size(); ) {
+            if (!(cap[i] == '$' && cap[i+1] == 'M' && cap[i+2] == '>')) { i++; continue; }
+            int plen = cap[i+3], cmd = cap[i+4]; size_t ps = i + 5;
+            if (ps + plen + 1 > cap.size()) break;
+            int crc = plen ^ cmd; for (int k = 0; k < plen; k++) crc ^= cap[ps+k];
+            if ((crc & 0xff) == cap[ps+plen] && cmd == 182) mspospd::feedDisplayPort(cv, &cap[ps], plen);
+            i = ps + plen + 1;
+        }
+        std::vector<OsdSnapshot> tl(1); tl[0].tMs = 0; cv.snapshot(tl[0].cells);
+        int nz = 0; for (int r = 0; r < mspospd::MAX_ROWS; r++) for (int c = 0; c < mspospd::MAX_COLS; c++) if (tl[0].cells[r][c].glyph) nz++;
+        fprintf(stderr, "osd-test: %d non-empty cells; compositing...\n", nz);
+        reencodeWithOsd(argv[2], argv[3], tl, nullptr);
+        return 0;
+    }
     if (argc >= 3 && std::string(argv[1]) == "--reencode-test") {
         ColortransLut lut; lut.build(2.5f, -0.15f);
         reencodeWithOvershootFix(argv[2], lut);
@@ -1322,6 +1442,7 @@ int main(int argc, char** argv)
     bool autoRecordEnabled = false;
     MspArmWatcher msp;
     uint32_t lastArmGen = 0;
+    uint32_t lastOsdGenRec = 0xffffffffu;
     // Start the MSP listener unconditionally: the same stream drives BOTH the ground-side OSD and
     // arm detection, and the OSD should work whether or not auto-record is enabled.
     msp.start();
@@ -1383,7 +1504,7 @@ int main(int argc, char** argv)
                        recBtn.x, recBtn.y, recBtn.w, recBtn.h, hit);
                 fflush(stdout);
                 if (hit) {
-                    if (rec.recording) stopRecording(rec, overshootFixEnabled);
+                    if (rec.recording) stopRecording(rec, overshootFixEnabled, osdEnabled);
                     else startRecording(rec, dir, fmt, videoStream);
                 }
                 bool ctHit = SDL_PointInRect(&p, &ctBtn);
@@ -1406,6 +1527,21 @@ int main(int argc, char** argv)
             }
         }
 
+        // While recording with the OSD on, log each canvas CHANGE (~10 Hz) with its time offset.
+        // The post-pass replays this so every frame gets the overlay as it looked at that moment,
+        // which a single end-of-recording snapshot could not do.
+        if (rec.recording && rec.session && osdEnabled && osdR.ready) {
+            uint32_t g = msp.osd.generation();
+            if (g != lastOsdGenRec) {
+                lastOsdGenRec = g;
+                OsdSnapshot snap;
+                snap.tMs = nowMs() - rec.session->startMs;
+                msp.osd.snapshot(snap.cells);
+                if (rec.session->osdTimeline.size() < 200000)   // ~600 MB ceiling; never unbounded
+                    rec.session->osdTimeline.push_back(snap);
+            }
+        }
+
         // Act on ARM/DISARM edges. Done here (not in the socket thread) so recording start/stop
         // stays on the same thread that owns fmt/rec, exactly like the REC button path.
         if (autoRecordEnabled) {
@@ -1414,7 +1550,7 @@ int main(int argc, char** argv)
                 lastArmGen = g;
                 bool nowArmed = msp.armed.load() == 1;
                 if (nowArmed && !rec.recording)      startRecording(rec, dir, fmt, videoStream);
-                else if (!nowArmed && rec.recording) stopRecording(rec, overshootFixEnabled);
+                else if (!nowArmed && rec.recording) stopRecording(rec, overshootFixEnabled, osdEnabled);
             }
         }
 
@@ -1712,7 +1848,7 @@ int main(int argc, char** argv)
     link.close();
     osdR.destroy();
     msp.stop();   // join the MSP listener before we start tearing down
-    stopRecording(rec, overshootFixEnabled);   // signals any still-active session to stop
+    stopRecording(rec, overshootFixEnabled, osdEnabled);   // signals any still-active session to stop
     for (auto& t : g_writerThreads) if (t.joinable()) t.join();   // let every writer finish/finalize before exit
 
     if (sws) sws_freeContext(sws);
