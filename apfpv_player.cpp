@@ -560,10 +560,22 @@ static void reencodeWithOvershootFix(const std::string& path, const ColortransLu
     fflush(stderr);
 }
 
+// One captured state of the ground-side OSD, stamped relative to the recording start. The OSD
+// post-pass needs to know what the overlay showed AT EACH MOMENT, and the canvas only changes at
+// ~10 Hz, so recording the changes is far cheaper than storing a per-frame overlay (~3 KB per
+// change, i.e. a few MB for a long flight).
+struct OsdSnapshot {
+    long long tMs;
+    mspospd::Cell cells[mspospd::MAX_ROWS][mspospd::MAX_COLS];
+};
+
 struct RecordingSession {
     AVFormatContext* outFmt = nullptr;
     std::string outPath;                // needed after the fact for the Overshoot Fix re-encode pass
     bool applyOvershootFix = false;     // snapshot of the toggle at stop time (see stopRecording)
+    bool wantOsdCopy = false;           // produce a second, OSD-burned-in file
+    long long startMs = 0;              // wall clock at recording start, for stamping snapshots
+    std::vector<OsdSnapshot> osdTimeline;
     int64_t startPts = AV_NOPTS_VALUE;
     int64_t lastDts = AV_NOPTS_VALUE;   // muxers require strictly increasing dts; heavy packet
                                         // loss/reordering can hand us a non-monotonic sequence,
@@ -990,6 +1002,72 @@ static bool decodeImageRGBA(const char* path, std::vector<uint8_t>& out, int& W,
     return ok;
 }
 
+// Pulls aalink's own status straight from the VTX, which is the only place several of these values
+// exist. aalink with EXTERNAL_OSD=1 writes them as key=value to /tmp/aalink_ext.msg; that file is
+// symlinked into the VTX webroot, so a plain HTTP GET returns the whole set:
+//   rssi_local -> UPLINK %      (aalink's own RSSI measurement -- NOT derivable on the ground)
+//   rssi_udp   -> DOWNLINK %    (the value we feed back to aalink)
+//   mcs, target_kbps, width_mhz, channel, txpwr_dbm, q, snr_norm
+// This is why uplink% previously showed "--": it is measured on the VTX and simply was not being
+// sent anywhere. Fetched over HTTP rather than UDP because the VTX has no UDP-capable tool at all
+// (busybox nc lacks -u, logger lacks -R, /dev/udp is unsupported), and because the same HTTP route
+// already works from the Android dongle path once the IP bridge is up.
+struct AalinkStats {
+    std::thread th;
+    std::atomic<bool> run{ false };
+    std::atomic<int> up{ -1 }, down{ -1 }, mcs{ -1 }, kbps{ -1 }, bw{ -1 }, ch{ -1 }, txpwr{ -1 }, q{ -1 };
+    std::atomic<long long> lastOkMs{ 0 };
+    std::string url;
+
+    void start(const std::string& u) {
+        url = u;
+        if (run.exchange(true)) return;
+        th = std::thread([this]() {
+            while (run.load()) {
+                AVIOContext* io = nullptr;
+                AVDictionary* o = nullptr;
+                av_dict_set(&o, "timeout", "1500000", 0);       // 1.5s, so a dead link can't wedge us
+                av_dict_set(&o, "rw_timeout", "1500000", 0);
+                if (avio_open2(&io, url.c_str(), AVIO_FLAG_READ, nullptr, &o) >= 0 && io) {
+                    char buf[2048]; int n = avio_read(io, (unsigned char*)buf, sizeof(buf) - 1);
+                    avio_closep(&io);
+                    if (n > 0) {
+                        buf[n] = 0; parse(buf); lastOkMs.store(nowMs());
+                        static int dbg = 0;
+                        if ((dbg++ % 10) == 0)
+                            fprintf(stderr, "aalink: up=%d%% dn=%d%% mcs=%d kbps=%d bw=%d ch=%d\n",
+                                    up.load(), down.load(), mcs.load(), kbps.load(), bw.load(), ch.load());
+                    }
+                }
+                av_dict_free(&o);
+                for (int i = 0; i < 10 && run.load(); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    void parse(const char* s) {
+        auto grab = [&](const char* key, std::atomic<int>& dst) {
+            // Match at a line start so "rssi_udp" can never be found inside another key.
+            size_t klen = strlen(key);
+            const char* p = s;
+            while ((p = strstr(p, key)) != nullptr) {
+                bool atLineStart = (p == s) || p[-1] == '\n' || p[-1] == '\r';
+                if (atLineStart && p[klen] == '=') { dst.store(atoi(p + klen + 1)); return; }
+                p += klen;
+            }
+        };
+        grab("rssi_local", up);   grab("rssi_udp", down);
+        grab("mcs", mcs);         grab("target_kbps", kbps);
+        grab("width_mhz", bw);    grab("channel", ch);
+        grab("txpwr_dbm", txpwr); grab("q", q);
+    }
+
+    bool fresh() const { return lastOkMs.load() != 0 && (nowMs() - lastOkMs.load()) < 5000; }
+
+    void stop() { if (!run.exchange(false)) return; if (th.joinable()) th.join(); }
+};
+
 // Link stats for the on-screen status line, replacing what the VTX used to burn in via aalink.
 // Everything here is measured AT THE RECEIVER, which is strictly more truthful than the old
 // burned-in line for the down-link direction: it is the same RSSI->percent value we feed back to
@@ -1249,6 +1327,14 @@ int main(int argc, char** argv)
     msp.start();
     LinkStats link;
     link.init();
+    // aalink's own status, polled from the VTX. Default is the AP-mode address; pass an alternative
+    // as argv[1] when the VTX is reachable on another subnet (e.g. a bench LAN).
+    AalinkStats aalink;
+    {
+        std::string vtx = (argc > 1 && argv[1][0] != '-') ? argv[1] : "192.168.0.1";
+        aalink.start("http://root:12345@" + vtx + "/aalink_ext.msg");
+        fprintf(stderr, "aalink stats: polling http://%s/aalink_ext.msg\n", vtx.c_str());
+    }
     OsdRenderer osdR;
     bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts" + APFPV_PATH_SEP + "font_btfl.png");
     SDL_Rect osdBtn{ 12, 180, 160, 60 };
@@ -1552,19 +1638,29 @@ int main(int argc, char** argv)
         link.tick(nowMs());
         char statLine[192];
         {
-            int dn = link.downPct();
+            // aalink is authoritative when its data is fresh: uplink% only exists there, and its
+            // downlink%/MCS are what the air side is actually acting on. Fall back to the locally
+            // measured RSSI/PHY rate when the VTX is unreachable.
+            bool aOk = aalink.fresh();
+            int dn = aOk ? aalink.down.load() : link.downPct();
+            int upv = aOk ? aalink.up.load() : -1;
             char dnBuf[16]; if (dn < 0) snprintf(dnBuf, sizeof(dnBuf), "--"); else snprintf(dnBuf, sizeof(dnBuf), "%d%%", dn);
+            char upBuf[16]; if (upv < 0) snprintf(upBuf, sizeof(upBuf), "--"); else snprintf(upBuf, sizeof(upBuf), "%d%%", upv);
+            char mcsBuf[16];
+            if (aOk && aalink.mcs.load() >= 0) snprintf(mcsBuf, sizeof(mcsBuf), "%d", aalink.mcs.load());
+            else                               snprintf(mcsBuf, sizeof(mcsBuf), "--");
             char rateBuf[24];
-            if (link.rxRateKbps) snprintf(rateBuf, sizeof(rateBuf), "%u", link.rxRateKbps / 1000);
-            else                 snprintf(rateBuf, sizeof(rateBuf), "--");
+            if (aOk && aalink.kbps.load() > 0)  snprintf(rateBuf, sizeof(rateBuf), "%d", aalink.kbps.load() / 1000);
+            else if (link.rxRateKbps)           snprintf(rateBuf, sizeof(rateBuf), "%u", link.rxRateKbps / 1000);
+            else                                snprintf(rateBuf, sizeof(rateBuf), "--");
             double gb = (double)link.bytesTotal / (1024.0 * 1024.0 * 1024.0);
             char sentBuf[24];
             if (gb >= 1.0) snprintf(sentBuf, sizeof(sentBuf), "%.2fGB", gb);
             else           snprintf(sentBuf, sizeof(sentBuf), "%.0fMB", (double)link.bytesTotal / (1024.0 * 1024.0));
             // Mirrors the old VTX line's fields, but every number here is measured at the receiver.
             snprintf(statLine, sizeof(statLine),
-                     "%dx%d %.1ffps | %.1fMbps | %s | link:%sM | up:-- dn:%s",
-                     texW, texH, fps, link.mbps, sentBuf, rateBuf, dnBuf);
+                     "%dx%d %.1ffps | %.1fMbps | %s | MCS:%s %sM | up:%s dn:%s",
+                     texW, texH, fps, link.mbps, sentBuf, mcsBuf, rateBuf, upBuf, dnBuf);
         }
         drawTextCached(ren, font, statLineText, statLine, 12, 10, SDL_Color{ 255, 255, 255, 255 });
 
@@ -1612,6 +1708,7 @@ int main(int argc, char** argv)
         }
     }
 
+    aalink.stop();
     link.close();
     osdR.destroy();
     msp.stop();   // join the MSP listener before we start tearing down
