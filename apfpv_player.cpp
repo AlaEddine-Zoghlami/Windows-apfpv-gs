@@ -552,6 +552,16 @@ int main(int argc, char** argv)
     int frameCount = 0;
     double fps = 0.0;
     auto fpsWindowStart = std::chrono::steady_clock::now();
+    // Set whenever the decoder is flushed (see the health-check block below):
+    // avcodec_flush_buffers() discards every reference picture, so the very
+    // next packet fed to it is decoding against NO reference at all. Feeding
+    // it a P/B-frame there either errors again immediately (re-triggering the
+    // same flush next second -- an unrecoverable flush/error loop, confirmed
+    // in the field as the "same issue... corrupt permanently" symptom) or
+    // decodes silently-wrong output with no error at all. Drop every packet
+    // here until a real IDR (AV_PKT_FLAG_KEY) arrives, exactly like a fresh
+    // decoder start -- the flush is only a real resync if paired with this.
+    bool waitingForKeyframe = false;
 
     while (running) {
         STEP(STEP_LOOP_TOP);
@@ -585,7 +595,12 @@ int main(int argc, char** argv)
         int rc = av_read_frame(fmt, pkt);
         if (rc >= 0) {
             ioNotedProgress();
-            if (pkt->stream_index == videoStream) {
+            if (pkt->stream_index == videoStream && waitingForKeyframe && (pkt->flags & AV_PKT_FLAG_KEY)) {
+                waitingForKeyframe = false;
+                fprintf(stderr, "Resync: keyframe arrived, resuming decode.\n");
+                fflush(stderr);
+            }
+            if (pkt->stream_index == videoStream && !waitingForKeyframe) {
                 STEP(STEP_WRITE_REC_PKT);
                 writeRecordingPacket(rec, pkt);
                 STEP(STEP_SEND_PACKET);
@@ -702,16 +717,38 @@ int main(int argc, char** argv)
             // survivable loss. Dozens means the reference-picture state is
             // genuinely corrupted and, left alone, will stay that way
             // indefinitely (the exact "permanently bad video" behavior this
-            // is meant to fix) -- flush the decoder so it discards that state
-            // and gets a clean shot at resyncing on the next keyframe, instead
-            // of limping along broken until a clean IDR happens to arrive on
-            // its own (which, under sustained loss, may never happen).
+            // is meant to fix) -- recreate the decoder so it discards that
+            // state and gets a clean shot at resyncing on the next keyframe,
+            // instead of limping along broken until a clean IDR happens to
+            // arrive on its own (which, under sustained loss, may never
+            // happen). A full recreation (createDecoder), not just
+            // avcodec_flush_buffers(): flushing alone was confirmed to reset
+            // only FFmpeg's own bookkeeping while a hwaccel (D3D11VA) session
+            // can keep corrupted GPU-side state flush never reaches -- the
+            // error log would go quiet but the video stayed visually broken.
+            // Pairs with waitingForKeyframe below: a freshly (re)created
+            // decoder has NO reference pictures at all, so the very next
+            // packet handed to it MUST be a real IDR, not whatever P/B-frame
+            // happens to arrive next -- feeding it anything else just
+            // re-corrupts (or re-errors) immediately, which is exactly the
+            // flush/error loop this two-part fix replaces.
             int errs = g_decodeErrorCount.exchange(0, std::memory_order_relaxed);
             fprintf(stderr, "[health] decode_errors_last_sec=%d\n", errs);   // always visible, not just on trigger
             constexpr int kFlushThreshold = 5;   // lowered from 30 pending real observed-rate data
             if (errs > kFlushThreshold) {
-                avcodec_flush_buffers(ctx);
-                fprintf(stderr, "Recovery: %d decode errors in the last second -- flushed decoder to resync.\n", errs);
+                // Build the replacement before freeing the old one -- a failed
+                // avcodec_open2 here must not leave ctx null (every send_packet/
+                // receive_frame call below assumes a live decoder); keep limping
+                // along on the old, possibly-corrupted one rather than crash.
+                AVCodecContext* newCtx = createDecoder(codec, fmt->streams[videoStream]->codecpar, hwDeviceCtx, hwOk);
+                if (newCtx) {
+                    avcodec_free_context(&ctx);
+                    ctx = newCtx;
+                    waitingForKeyframe = true;
+                    fprintf(stderr, "Recovery: %d decode errors in the last second -- recreated decoder, waiting for keyframe.\n", errs);
+                } else {
+                    fprintf(stderr, "Recovery: %d decode errors, but decoder recreation failed -- keeping existing decoder.\n", errs);
+                }
             }
             fflush(stderr);
         }
