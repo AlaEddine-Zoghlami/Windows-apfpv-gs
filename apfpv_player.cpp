@@ -42,6 +42,7 @@ extern "C" {
 #include <memory>
 #include <vector>
 #include <cmath>
+#include "msp_osd.h"
 
 #ifdef _WIN32
   #define APFPV_PATH_SEP       "\\"
@@ -802,6 +803,9 @@ struct MspArmWatcher {
     std::atomic<int>  armed{ -1 };      // -1 = unknown (no MSP_STATUS yet), 0 = disarmed, 1 = armed
     std::atomic<uint32_t> gen{ 0 };     // bumped on every state CHANGE so the UI loop can see edges
     int port = 14550;
+    // The SAME forwarded stream also carries MSP_DISPLAYPORT (cmd 182) -- Betaflight's finished
+    // OSD canvas. Feeding it here means one socket serves both arm detection and the OSD.
+    mspospd::Canvas osd;
 
     void start() {
         if (run.exchange(true)) return;
@@ -861,6 +865,9 @@ struct MspArmWatcher {
             // u16 sensor, u32 flightModeFlags. Bit 0 = Betaflight box id 0 = ARM. Verified live:
             // flags read 0x104 while disarmed (bits 2+8; box id 2 is HORIZON, matching the OSD's
             // "HOR" mode field at that moment) -- which confirms this offset and bit numbering.
+            if (cmd == 182) {
+                mspospd::feedDisplayPort(osd, &b[ps], plen);
+            }
             if ((cmd == 101 || cmd == 150) && plen >= 10) {
                 uint32_t f = (uint32_t)b[ps + 6] | ((uint32_t)b[ps + 7] << 8)
                            | ((uint32_t)b[ps + 8] << 16) | ((uint32_t)b[ps + 9] << 24);
@@ -874,6 +881,118 @@ struct MspArmWatcher {
             }
             i = ps + plen + 1;
         }
+    }
+};
+
+// Decode the Betaflight font atlas (a 4-bit palette PNG with tRNS transparency) to packed RGBA8
+// using libav, so palette transparency is honoured by the decoder rather than reimplemented.
+static bool decodeImageRGBA(const char* path, std::vector<uint8_t>& out, int& W, int& H) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path, nullptr, nullptr) < 0) return false;
+    if (avformat_find_stream_info(fmt, nullptr) < 0) { avformat_close_input(&fmt); return false; }
+    int vs = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; i++)
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { vs = (int)i; break; }
+    if (vs < 0) { avformat_close_input(&fmt); return false; }
+    const AVCodec* dec = avcodec_find_decoder(fmt->streams[vs]->codecpar->codec_id);
+    AVCodecContext* ctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+    if (!ctx) { avformat_close_input(&fmt); return false; }
+    avcodec_parameters_to_context(ctx, fmt->streams[vs]->codecpar);
+    if (avcodec_open2(ctx, dec, nullptr) < 0) { avcodec_free_context(&ctx); avformat_close_input(&fmt); return false; }
+    AVPacket* pkt = av_packet_alloc(); AVFrame* fr = av_frame_alloc();
+    bool got = false;
+    while (!got && av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == vs && avcodec_send_packet(ctx, pkt) == 0)
+            if (avcodec_receive_frame(ctx, fr) == 0) got = true;
+        av_packet_unref(pkt);
+    }
+    if (!got) { avcodec_send_packet(ctx, nullptr); got = (avcodec_receive_frame(ctx, fr) == 0); }
+    bool ok = false;
+    if (got) {
+        W = fr->width; H = fr->height;
+        out.assign((size_t)W * H * 4, 0);
+        uint8_t* dst[4] = { out.data(), nullptr, nullptr, nullptr };
+        int dls[4] = { W * 4, 0, 0, 0 };
+        SwsContext* sws = sws_getContext(W, H, (AVPixelFormat)fr->format, W, H,
+                                          AV_PIX_FMT_RGBA, SWS_POINT, nullptr, nullptr, nullptr);
+        if (sws) { sws_scale(sws, fr->data, fr->linesize, 0, H, dst, dls); sws_freeContext(sws); ok = true; }
+    }
+    av_frame_free(&fr); av_packet_free(&pkt);
+    avcodec_free_context(&ctx); avformat_close_input(&fmt);
+    return ok;
+}
+
+// Ground-side OSD: rasterises the MSP_DISPLAYPORT canvas into a cached texture. Rebuilt only
+// when the canvas generation changes (~10 Hz) rather than per video frame (90 Hz), so the
+// per-frame cost is a single textured quad.
+struct OsdRenderer {
+    SDL_Texture* atlasTex = nullptr;   // the font atlas
+    SDL_Texture* canvasTex = nullptr;  // composed OSD, alpha-blended over the video
+    mspospd::FontAtlas atlas;
+    std::vector<uint8_t> atlasRGBA;
+    int cols = 0, rows = 0, texW = 0, texH = 0;
+    uint32_t lastGen = 0xffffffffu;
+    bool ready = false;
+
+    bool init(SDL_Renderer* ren, const std::string& fontPath) {
+        int fw = 0, fh = 0;
+        if (!decodeImageRGBA(fontPath.c_str(), atlasRGBA, fw, fh)) {
+            fprintf(stderr, "OSD: font atlas '%s' not found/decodable -- ground OSD disabled\n", fontPath.c_str());
+            return false;
+        }
+        atlas = mspospd::makeAtlas(atlasRGBA.data(), fw, fh);
+        mspospd::canvasSizeFor(atlas.glyphW, cols, rows);
+        texW = cols * atlas.glyphW; texH = rows * atlas.glyphH;
+        SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(atlasRGBA.data(), fw, fh, 32, fw * 4,
+                                                            SDL_PIXELFORMAT_ABGR8888);
+        if (!s) return false;
+        atlasTex = SDL_CreateTextureFromSurface(ren, s);
+        SDL_FreeSurface(s);
+        if (!atlasTex) return false;
+        canvasTex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, texW, texH);
+        if (!canvasTex) return false;
+        SDL_SetTextureBlendMode(canvasTex, SDL_BLENDMODE_BLEND);
+        ready = true;
+        fprintf(stderr, "OSD: atlas %dx%d glyph %dx%d -> canvas %dx%d cells (%dx%d px)\n",
+                fw, fh, atlas.glyphW, atlas.glyphH, cols, rows, texW, texH);
+        return true;
+    }
+
+    // Re-rasterise into canvasTex if the canvas changed. Must run on the render thread.
+    void refresh(SDL_Renderer* ren, mspospd::Canvas& cv) {
+        if (!ready) return;
+        uint32_t g = cv.generation();
+        if (g == lastGen) return;
+        lastGen = g;
+        mspospd::Cell cells[mspospd::MAX_ROWS][mspospd::MAX_COLS];
+        cv.snapshot(cells);
+        SDL_Texture* prev = SDL_GetRenderTarget(ren);
+        SDL_SetRenderTarget(ren, canvasTex);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);       // fully transparent, not black
+        SDL_RenderClear(ren);
+        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) {
+            uint8_t gl = cells[r][c].glyph;
+            if (!gl) continue;                          // 0 = empty cell
+            int sx, sy, sw, sh; atlas.srcRect(gl, cells[r][c].page, sx, sy, sw, sh);
+            SDL_Rect src{ sx, sy, sw, sh };
+            SDL_Rect dst{ c * atlas.glyphW, r * atlas.glyphH, atlas.glyphW, atlas.glyphH };
+            SDL_RenderCopy(ren, atlasTex, &src, &dst);
+        }
+        SDL_SetRenderTarget(ren, prev);
+    }
+
+    // Draw the OSD over the video, matching the video's letterboxed rect so cells land exactly
+    // where the VTX would have burned them.
+    void draw(SDL_Renderer* ren, const SDL_Rect& videoDst) {
+        if (!ready || lastGen == 0xffffffffu) return;
+        SDL_RenderCopy(ren, canvasTex, nullptr, &videoDst);
+    }
+
+    void destroy() {
+        if (canvasTex) { SDL_DestroyTexture(canvasTex); canvasTex = nullptr; }
+        if (atlasTex) { SDL_DestroyTexture(atlasTex); atlasTex = nullptr; }
+        ready = false;
     }
 };
 
@@ -977,6 +1096,13 @@ int main(int argc, char** argv)
     bool autoRecordEnabled = false;
     MspArmWatcher msp;
     uint32_t lastArmGen = 0;
+    // Start the MSP listener unconditionally: the same stream drives BOTH the ground-side OSD and
+    // arm detection, and the OSD should work whether or not auto-record is enabled.
+    msp.start();
+    OsdRenderer osdR;
+    bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts" + APFPV_PATH_SEP + "font_btfl.png");
+    SDL_Rect osdBtn{ 12, 180, 160, 60 };
+    CachedText osdBtnText;
 
     RecordState rec;
     bool running = true;
@@ -1030,10 +1156,13 @@ int main(int argc, char** argv)
                     printf("Overshoot Fix -> %s\n", overshootFixEnabled ? "ON" : "OFF");
                     fflush(stdout);
                 }
+                if (SDL_PointInRect(&p, &osdBtn) && osdR.ready) {
+                    osdEnabled = !osdEnabled;
+                    printf("Ground OSD -> %s\n", osdEnabled ? "ON" : "OFF"); fflush(stdout);
+                }
                 if (SDL_PointInRect(&p, &autoBtn)) {
                     autoRecordEnabled = !autoRecordEnabled;
-                    if (autoRecordEnabled) { msp.start(); lastArmGen = msp.gen.load(); }
-                    else                   { msp.stop(); }
+                    if (autoRecordEnabled) lastArmGen = msp.gen.load();   // don't fire on stale state
                     printf("Auto record (on arm) -> %s%s\n", autoRecordEnabled ? "ON" : "OFF",
                            autoRecordEnabled ? "  [needs msposd -d -o <thisPC>:14550 on the VTX]" : "");
                     fflush(stdout);
@@ -1263,6 +1392,9 @@ int main(int argc, char** argv)
                 dst.x = (winW - dst.w) / 2;
             }
             SDL_RenderCopy(ren, tex, NULL, &dst);
+            // Ground-side OSD, aligned to the SAME letterboxed rect as the video so each cell
+            // lands exactly where the VTX would have burned it.
+            if (osdEnabled) { osdR.refresh(ren, msp.osd); osdR.draw(ren, dst); }
         }
 
         STEP(STEP_DRAW_TEXT);
@@ -1288,6 +1420,13 @@ int main(int argc, char** argv)
         // AUTO: green when enabled. Label reflects the live arm state once MSP is flowing, so it
         // doubles as a "is telemetry actually arriving?" indicator -- "AUTO --" means enabled but
         // no MSP_STATUS seen yet (msposd missing -d/-o, or the IP route isn't up).
+        SDL_SetRenderDrawColor(ren, osdEnabled ? 30 : 60, osdEnabled ? 120 : 60, osdEnabled ? 160 : 60, 220);
+        SDL_RenderFillRect(ren, &osdBtn);
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_RenderDrawRect(ren, &osdBtn);
+        drawTextCached(ren, font, osdBtnText, osdEnabled ? "OSD ON" : "OSD", osdBtn.x + 20, osdBtn.y + 18,
+                       SDL_Color{ 255, 255, 255, 255 });
+
         SDL_SetRenderDrawColor(ren, autoRecordEnabled ? 30 : 60, autoRecordEnabled ? 160 : 60, 60, 220);
         SDL_RenderFillRect(ren, &autoBtn);
         SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
@@ -1307,6 +1446,7 @@ int main(int argc, char** argv)
         }
     }
 
+    osdR.destroy();
     msp.stop();   // join the MSP listener before we start tearing down
     stopRecording(rec, overshootFixEnabled);   // signals any still-active session to stop
     for (auto& t : g_writerThreads) if (t.joinable()) t.join();   // let every writer finish/finalize before exit
