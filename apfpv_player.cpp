@@ -120,11 +120,32 @@ static int ioInterruptCallback(void*) {
 // doesn't touch the decoder -- so a reconnect mid-stream is just "throw away
 // the old AVFormatContext, get a new one"; the AVCodecContext, hwDeviceCtx
 // and codec pointer all stay valid and untouched across it.
-static AVFormatContext* openInput(const std::string& sdpPath, int& videoStreamOut)
+//
+// isReconnect=true (every call after the first) skips the thorough stream
+// probe: confirmed by trace data that a real network gap big enough to hit
+// the I/O timeout can cascade into a RECONNECT LOOP that makes the outage
+// much longer than the underlying gap actually was --
+//   av_read_frame blocks 2.5s -> timeout -> reconnect
+//   "Could not find codec parameters ... unspecified size" (default probing
+//     wants more live data than a still-recovering link is handing it)
+//   "Reconnected." anyway, but av_read_frame blocks another 2.5s immediately
+//   -> repeat, each cycle adding another ~2.5s+ on top of the original gap
+// We already know the codec/dimensions from the first successful connect
+// (createDecoder() in main() was built from it and is never touched by a
+// reconnect) -- a reconnect only needs the video stream's INDEX, which the
+// SDP's own "m=video" line establishes as soon as avformat_open_input
+// creates the stream, before any packets are even read. So skip
+// avformat_find_stream_info's data-hungry analysis on a reconnect and take
+// the first video stream directly instead of waiting on it to fully parse.
+static AVFormatContext* openInput(const std::string& sdpPath, int& videoStreamOut, bool isReconnect)
 {
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "protocol_whitelist", "file,rtp,udp", 0);
     av_dict_set(&opts, "timeout", "2000000", 0);
+    if (isReconnect) {
+        av_dict_set(&opts, "probesize", "32768", 0);
+        av_dict_set(&opts, "analyzeduration", "0", 0);
+    }
     // Absorb bursty Wi-Fi delivery (A-MPDU aggregation hands the OS many RTP
     // packets in a tight cluster, not evenly spaced) instead of dropping them
     // outright when a receive buffer fills or the jitter window is too tight
@@ -165,11 +186,20 @@ static AVFormatContext* openInput(const std::string& sdpPath, int& videoStreamOu
     if (rc < 0) return nullptr;   // avformat_open_input frees fmt itself on failure
 
     ioNotedProgress();
-    if (avformat_find_stream_info(fmt, nullptr) < 0) {
-        avformat_close_input(&fmt);
-        return nullptr;
+    // The SDP demuxer's read_header (invoked by avformat_open_input above)
+    // already creates one AVStream per "m=..." line and sets its
+    // codec_type/codec_id straight from the SDP (e.g. "m=video ... RTP/AVP
+    // 97" + "a=rtpmap:97 H265/90000") -- avformat_find_stream_info's job is
+    // filling in the REST of codecpar (width/height/etc.) by reading and
+    // analyzing actual packets, which is exactly the part a reconnect can't
+    // afford to wait on. Skip it and scan fmt->streams directly.
+    if (!isReconnect) {
+        if (avformat_find_stream_info(fmt, nullptr) < 0) {
+            avformat_close_input(&fmt);
+            return nullptr;
+        }
+        ioNotedProgress();
     }
-    ioNotedProgress();
 
     int videoStream = -1;
     for (unsigned i = 0; i < fmt->nb_streams; i++) {
@@ -542,7 +572,7 @@ int main(int argc, char** argv)
     avformat_network_init();
 
     int videoStream = -1;
-    AVFormatContext* fmt = openInput(sdpPath, videoStream);
+    AVFormatContext* fmt = openInput(sdpPath, videoStream, /*isReconnect=*/false);
     if (!fmt) { fprintf(stderr, "Failed to open %s\n", sdpPath.c_str()); return 1; }
 
     AVCodecParameters* par = fmt->streams[videoStream]->codecpar;
@@ -769,7 +799,7 @@ int main(int argc, char** argv)
             fflush(stderr);
             avformat_close_input(&fmt);
             int newVideoStream = -1;
-            AVFormatContext* newFmt = openInput(sdpPath, newVideoStream);
+            AVFormatContext* newFmt = openInput(sdpPath, newVideoStream, /*isReconnect=*/true);
             if (newFmt) {
                 fmt = newFmt;
                 videoStream = newVideoStream;
