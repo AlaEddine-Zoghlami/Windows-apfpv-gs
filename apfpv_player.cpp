@@ -11,15 +11,23 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 #include <SDL.h>
 #include <SDL_ttf.h>
 #ifdef _WIN32
+// winsock2.h MUST precede windows.h: windows.h pulls in the ancient winsock.h and the two
+// redefine each other (sockaddr_in, FD_SET, ...) if the order is reversed.
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #else
 #include <unistd.h>
 #include <linux/limits.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #endif
 #include <cstdio>
 #include <cstring>
@@ -275,8 +283,232 @@ static void watchdogThread(const std::string& logPath)
 // recording active when the window closes still gets a chance to finalize
 // properly. Interactive stop/start from the REC button stays non-blocking --
 // only program exit waits.
+// OpenIPC "Overshoot Fix" colortrans reversal, ported from PixelPilot's Android GL shader
+// (GLFanoutRenderer.h): rev = clamp((rgb + offset) * gain, 0, 1), the identical affine transform
+// on R, G and B. Because all three channels get the same transform, it factors exactly into YUV
+// space -- Y' = gain*(Y+offset), U' = gain*(U-mid)+mid, V' = gain*(V-mid)+mid (mid = 128) -- so it
+// can be applied straight to the decoded YUV420P planes via an 8-bit lookup table, no RGB
+// round-trip needed. Defaults (gain 2.5, offset -0.15) match PixelPilot_rk/Android.
+struct ColortransLut {
+    uint8_t y[256], c[256];
+    void build(float gain, float offset) {
+        int off8 = (int)lrintf(offset * 255.0f);
+        for (int i = 0; i < 256; i++) {
+            int yv = (int)lrintf((i + off8) * gain);
+            y[i] = (uint8_t)(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
+            int cv = (int)lrintf((i - 128) * gain) + 128;
+            c[i] = (uint8_t)(cv < 0 ? 0 : (cv > 255 ? 255 : cv));
+        }
+    }
+};
+static void applyColortrans(AVFrame* f, const ColortransLut& lut) {
+    for (int y = 0; y < f->height; y++) {
+        uint8_t* row = f->data[0] + y * f->linesize[0];
+        for (int x = 0; x < f->width; x++) row[x] = lut.y[row[x]];
+    }
+    int cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
+    for (int p = 1; p <= 2; p++) {
+        for (int y = 0; y < ch; y++) {
+            uint8_t* row = f->data[p] + y * f->linesize[p];
+            for (int x = 0; x < cw; x++) row[x] = lut.c[row[x]];
+        }
+    }
+}
+
+// Post-process pass, run only when a recording was stopped with Overshoot Fix active (see
+// stopRecording): decode the just-finalized .ts, apply the same YUV LUT the live view uses,
+// re-encode, and replace the original file. Keeps the LIVE recording path exactly as fast and
+// lossless as before (still a straight packet remux, see startRecording/writeRecordingPacket) --
+// only recordings actually made with the fix on pay this one-time background re-encode cost.
+static void reencodeWithOvershootFix(const std::string& path, const ColortransLut& lut)
+{
+    std::string tmpPath = path + ".fixing.ts";
+    AVFormatContext* inFmt = nullptr;
+    AVFormatContext* outFmt = nullptr;
+    AVCodecContext* decCtx = nullptr;
+    AVCodecContext* encCtx = nullptr;
+    SwsContext* sws = nullptr;
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* frameYuv = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    AVPacket* outPkt = av_packet_alloc();
+    AVStream* outStream = nullptr;
+    bool ok = false;
+
+    auto cleanup = [&]() {
+        if (outFmt) { if (outFmt->pb) avio_closep(&outFmt->pb); avformat_free_context(outFmt); }
+        if (decCtx) avcodec_free_context(&decCtx);
+        if (encCtx) avcodec_free_context(&encCtx);
+        if (sws) sws_freeContext(sws);
+        av_frame_free(&frame);
+        av_frame_free(&frameYuv);
+        av_packet_free(&pkt);
+        av_packet_free(&outPkt);
+        if (inFmt) avformat_close_input(&inFmt);
+    };
+
+    if (avformat_open_input(&inFmt, path.c_str(), nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(inFmt, nullptr) < 0) {
+        fprintf(stderr, "Overshoot Fix re-encode: failed to open/probe %s\n", path.c_str());
+        cleanup(); return;
+    }
+    int vs = -1;
+    for (unsigned i = 0; i < inFmt->nb_streams; i++)
+        if (inFmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { vs = (int)i; break; }
+    if (vs < 0) {
+        fprintf(stderr, "Overshoot Fix re-encode: no video stream in %s\n", path.c_str());
+        cleanup(); return;
+    }
+
+    const AVCodec* dec = avcodec_find_decoder(inFmt->streams[vs]->codecpar->codec_id);
+    decCtx = dec ? avcodec_alloc_context3(dec) : nullptr;
+    if (!decCtx || avcodec_parameters_to_context(decCtx, inFmt->streams[vs]->codecpar) < 0 ||
+        avcodec_open2(decCtx, dec, nullptr) < 0) {
+        fprintf(stderr, "Overshoot Fix re-encode: failed to open decoder for %s\n", path.c_str());
+        cleanup(); return;
+    }
+
+    // Explicit software encoders by name, not avcodec_find_encoder(codec_id) -- that can hand
+    // back a hardware encoder (nvenc/amf/mf) that then fails avcodec_open2 on a machine without
+    // the matching GPU. libx264/libx265 are always available in this build (verified separately).
+    bool isHevc = inFmt->streams[vs]->codecpar->codec_id == AV_CODEC_ID_HEVC;
+    const AVCodec* enc = avcodec_find_encoder_by_name(isHevc ? "libx265" : "libx264");
+    if (!enc) {
+        fprintf(stderr, "Overshoot Fix re-encode: no %s encoder available\n", isHevc ? "libx265" : "libx264");
+        cleanup(); return;
+    }
+    encCtx = avcodec_alloc_context3(enc);
+    encCtx->width = decCtx->width;
+    encCtx->height = decCtx->height;
+    encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+    encCtx->time_base = inFmt->streams[vs]->time_base;
+    encCtx->framerate = inFmt->streams[vs]->avg_frame_rate;
+    encCtx->gop_size = 60;
+    encCtx->bit_rate = inFmt->streams[vs]->codecpar->bit_rate > 0
+                         ? inFmt->streams[vs]->codecpar->bit_rate : 8000000;
+    // Match the ORIGINAL stream's colorimetry tags exactly. Without this, libx264/libx265 falls
+    // back to its own defaults (which don't necessarily match), so a player decodes numerically
+    // correct pixels through the WRONG YUV->RGB matrix/range -- looks like "corrupted" colors even
+    // though the LUT math itself is right.
+    encCtx->color_range     = decCtx->color_range;
+    encCtx->color_primaries = decCtx->color_primaries;
+    encCtx->color_trc       = decCtx->color_trc;
+    encCtx->colorspace      = decCtx->colorspace;
+    av_opt_set(encCtx->priv_data, "preset", "veryfast", 0);
+
+    if (avformat_alloc_output_context2(&outFmt, nullptr, "mpegts", tmpPath.c_str()) < 0 || !outFmt) {
+        fprintf(stderr, "Overshoot Fix re-encode: failed to allocate output for %s\n", tmpPath.c_str());
+        cleanup(); return;
+    }
+    if (outFmt->oformat->flags & AVFMT_GLOBALHEADER) encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (avcodec_open2(encCtx, enc, nullptr) < 0) {
+        fprintf(stderr, "Overshoot Fix re-encode: failed to open %s encoder\n", isHevc ? "libx265" : "libx264");
+        cleanup(); return;
+    }
+    outStream = avformat_new_stream(outFmt, nullptr);
+    if (!outStream || avcodec_parameters_from_context(outStream->codecpar, encCtx) < 0) {
+        fprintf(stderr, "Overshoot Fix re-encode: failed to set up output stream\n");
+        cleanup(); return;
+    }
+    outStream->time_base = encCtx->time_base;
+    if (avio_open(&outFmt->pb, tmpPath.c_str(), AVIO_FLAG_WRITE) < 0 ||
+        avformat_write_header(outFmt, nullptr) < 0) {
+        fprintf(stderr, "Overshoot Fix re-encode: failed to open/write header for %s\n", tmpPath.c_str());
+        cleanup(); return;
+    }
+
+    int decodedCount = 0, encodedCount = 0;
+    char errbuf[128];
+
+    // Converts (if needed), LUTs, encodes and muxes one decoded frame. Shared by the main read
+    // loop and both end-of-stream flushes below so the encode/write logic isn't triplicated.
+    auto encodeFrame = [&](AVFrame* f) {
+        decodedCount++;
+        AVFrame* useFrame = f;
+        if (f->format != AV_PIX_FMT_YUV420P) {
+            if (!sws) sws = sws_getContext(f->width, f->height, (AVPixelFormat)f->format,
+                                            f->width, f->height, AV_PIX_FMT_YUV420P,
+                                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+            av_frame_unref(frameYuv);
+            frameYuv->format = AV_PIX_FMT_YUV420P;
+            frameYuv->width = f->width; frameYuv->height = f->height;
+            av_frame_get_buffer(frameYuv, 32);
+            sws_scale(sws, f->data, f->linesize, 0, f->height, frameYuv->data, frameYuv->linesize);
+            frameYuv->pts = f->pts;
+            useFrame = frameYuv;
+        } else {
+            // f comes straight from the decoder and may be a pooled/shared buffer (refcount > 1)
+            // -- writing the LUT into it in-place without this is unsafe (undefined/corrupted
+            // results), unlike frameYuv above which is always a fresh, exclusively-owned buffer.
+            av_frame_make_writable(f);
+        }
+        applyColortrans(useFrame, lut);
+        int sendErr = avcodec_send_frame(encCtx, useFrame);
+        if (sendErr < 0) {
+            av_strerror(sendErr, errbuf, sizeof(errbuf));
+            fprintf(stderr, "Overshoot Fix re-encode: avcodec_send_frame failed: %s\n", errbuf);
+            return;
+        }
+        int rc;
+        while ((rc = avcodec_receive_packet(encCtx, outPkt)) == 0) {
+            outPkt->stream_index = 0;
+            av_packet_rescale_ts(outPkt, encCtx->time_base, outStream->time_base);
+            av_interleaved_write_frame(outFmt, outPkt);
+            av_packet_unref(outPkt);
+            encodedCount++;
+        }
+        if (rc != AVERROR(EAGAIN) && rc != AVERROR_EOF) {
+            av_strerror(rc, errbuf, sizeof(errbuf));
+            fprintf(stderr, "Overshoot Fix re-encode: avcodec_receive_packet failed: %s\n", errbuf);
+        }
+    };
+
+    while (av_read_frame(inFmt, pkt) >= 0) {
+        if (pkt->stream_index == vs) {
+            int sendErr = avcodec_send_packet(decCtx, pkt);
+            if (sendErr < 0) {
+                av_strerror(sendErr, errbuf, sizeof(errbuf));
+                fprintf(stderr, "Overshoot Fix re-encode: avcodec_send_packet failed: %s\n", errbuf);
+            } else {
+                while (avcodec_receive_frame(decCtx, frame) == 0) {
+                    encodeFrame(frame);
+                    av_frame_unref(frame);
+                }
+            }
+        }
+        av_packet_unref(pkt);
+    }
+    avcodec_send_packet(decCtx, nullptr);           // flush decoder
+    while (avcodec_receive_frame(decCtx, frame) == 0) { encodeFrame(frame); av_frame_unref(frame); }
+    avcodec_send_frame(encCtx, nullptr);             // flush encoder
+    while (avcodec_receive_packet(encCtx, outPkt) == 0) {
+        outPkt->stream_index = 0;
+        av_packet_rescale_ts(outPkt, encCtx->time_base, outStream->time_base);
+        av_interleaved_write_frame(outFmt, outPkt);
+        av_packet_unref(outPkt);
+        encodedCount++;
+    }
+    av_write_trailer(outFmt);
+    fprintf(stderr, "Overshoot Fix re-encode: decoded %d frames, encoded %d packets\n", decodedCount, encodedCount);
+    ok = (encodedCount > 0);
+    cleanup();
+
+    if (ok) {
+        remove(path.c_str());
+        if (rename(tmpPath.c_str(), path.c_str()) == 0)
+            fprintf(stderr, "Overshoot Fix: re-encoded recording -> %s\n", path.c_str());
+        else
+            fprintf(stderr, "Overshoot Fix: re-encode finished but rename to %s failed\n", path.c_str());
+    } else {
+        remove(tmpPath.c_str());
+    }
+    fflush(stderr);
+}
+
 struct RecordingSession {
     AVFormatContext* outFmt = nullptr;
+    std::string outPath;                // needed after the fact for the Overshoot Fix re-encode pass
+    bool applyOvershootFix = false;     // snapshot of the toggle at stop time (see stopRecording)
     int64_t startPts = AV_NOPTS_VALUE;
     int64_t lastDts = AV_NOPTS_VALUE;   // muxers require strictly increasing dts; heavy packet
                                         // loss/reordering can hand us a non-monotonic sequence,
@@ -365,6 +597,7 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
         return;
     }
 
+    session->outPath = outPath;
     rs.session = session;
     rs.recording = true;
 
@@ -390,6 +623,11 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
         av_write_trailer(session->outFmt);
         avio_closep(&session->outFmt->pb);
         avformat_free_context(session->outFmt);
+        if (session->applyOvershootFix) {
+            ColortransLut lut;
+            lut.build(2.5f, -0.15f);
+            reencodeWithOvershootFix(session->outPath, lut);
+        }
     }).detach();
 
     printf("Recording -> %s\n", outPath.c_str());
@@ -452,12 +690,13 @@ static void writeRecordingPacket(RecordState& rs, const AVPacket* pkt)
 // Non-blocking: hands the session off to its writer thread (which already
 // holds its own reference) and forgets it immediately. Draining the queue
 // and finalizing the file happen in the background.
-static void stopRecording(RecordState& rs)
+static void stopRecording(RecordState& rs, bool overshootFixEnabled)
 {
     if (!rs.recording) return;
     {
         std::lock_guard<std::mutex> lk(rs.session->qMutex);
         rs.session->running = false;
+        rs.session->applyOvershootFix = overshootFixEnabled;
     }
     rs.session->qCv.notify_one();
     rs.session.reset();
@@ -547,40 +786,106 @@ static void drawTextCached(SDL_Renderer* ren, TTF_Font* font, CachedText& cache,
     SDL_RenderCopy(ren, cache.tex, NULL, &dst);
 }
 
-// OpenIPC "Overshoot Fix" colortrans reversal, ported from PixelPilot's Android GL shader
-// (GLFanoutRenderer.h): rev = clamp((rgb + offset) * gain, 0, 1), the identical affine transform
-// on R, G and B. Because all three channels get the same transform, it factors exactly into YUV
-// space -- Y' = gain*(Y+offset), U' = gain*(U-mid)+mid, V' = gain*(V-mid)+mid (mid = 128) -- so it
-// can be applied straight to the decoded YUV420P planes via an 8-bit lookup table, no RGB
-// round-trip needed. Defaults (gain 2.5, offset -0.15) match PixelPilot_rk/Android.
-struct ColortransLut {
-    uint8_t y[256], c[256];
-    void build(float gain, float offset) {
-        int off8 = (int)lrintf(offset * 255.0f);
-        for (int i = 0; i < 256; i++) {
-            int yv = (int)lrintf((i + off8) * gain);
-            y[i] = (uint8_t)(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
-            int cv = (int)lrintf((i - 128) * gain) + 128;
-            c[i] = (uint8_t)(cv < 0 ? 0 : (cv > 255 ? 255 : cv));
+// Watches for MSP telemetry forwarded from the VTX and tracks flight-controller ARM state, so
+// recording can cover exactly the armed window. Mirrors the Android MspArmListener; see that class
+// for the full protocol notes. The two things worth repeating here:
+//
+//  - msposd on the VTX MUST run with `-d` as well as `-o <thisPC>:14550`. Without `-d` msposd never
+//    ASKS the FC for anything and the stream is 100% MSP_DISPLAYPORT (cmd 182) -- pre-rendered
+//    "draw these characters here" OSD commands with no structured telemetry, so no arm bit exists
+//    on the wire at all. With `-d` msposd polls and MSP_STATUS (cmd 101) appears.
+//  - This uses an ordinary OS UDP socket, which is correct for the Windows GS because it talks to
+//    the VTX over the stock Wi-Fi driver in infrastructure mode (same as lqfeedback_cli).
+struct MspArmWatcher {
+    std::thread th;
+    std::atomic<bool> run{ false };
+    std::atomic<int>  armed{ -1 };      // -1 = unknown (no MSP_STATUS yet), 0 = disarmed, 1 = armed
+    std::atomic<uint32_t> gen{ 0 };     // bumped on every state CHANGE so the UI loop can see edges
+    int port = 14550;
+
+    void start() {
+        if (run.exchange(true)) return;
+        th = std::thread([this]() {
+#ifdef _WIN32
+            WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+            int s = (int)::socket(AF_INET, SOCK_DGRAM, 0);
+            if (s < 0) { fprintf(stderr, "MSP: socket() failed\n"); return; }
+            sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+            a.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (::bind(s, (sockaddr*)&a, sizeof(a)) != 0) {
+                fprintf(stderr, "MSP: bind(%d) failed -- auto-record on arm disabled\n", port);
+#ifdef _WIN32
+                ::closesocket(s);
+#else
+                ::close(s);
+#endif
+                return;
+            }
+            // 1s timeout so `run` is re-checked and shutdown is prompt.
+#ifdef _WIN32
+            DWORD tv = 1000; ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+            timeval tv{ 1, 0 }; ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+            fprintf(stderr, "MSP: listening for arm state on UDP %d\n", port);
+            std::vector<uint8_t> buf(2048);
+            while (run.load()) {
+                int n = ::recv(s, (char*)buf.data(), (int)buf.size(), 0);
+                if (n > 0) parse(buf.data(), n);
+            }
+#ifdef _WIN32
+            ::closesocket(s);
+#else
+            ::close(s);
+#endif
+        });
+    }
+
+    void stop() {
+        if (!run.exchange(false)) return;
+        if (th.joinable()) th.join();
+    }
+
+    // Walk every MSP v1 frame in the datagram (msposd aggregates several per packet).
+    void parse(const uint8_t* b, int len) {
+        int i = 0;
+        while (i + 5 <= len) {
+            if (!(b[i] == '$' && b[i + 1] == 'M' && b[i + 2] == '>')) { i++; continue; }
+            int plen = b[i + 3], cmd = b[i + 4], ps = i + 5;
+            if (ps + plen + 1 > len) break;                  // truncated -- don't guess
+            int crc = plen ^ cmd;
+            for (int k = 0; k < plen; k++) crc ^= b[ps + k];
+            if ((crc & 0xff) != b[ps + plen]) { i++; continue; }   // false "$M>" match in payload
+            // MSP_STATUS(101) / MSP_STATUS_EX(150) share a prefix: u16 cycleTime, u16 i2cErrors,
+            // u16 sensor, u32 flightModeFlags. Bit 0 = Betaflight box id 0 = ARM. Verified live:
+            // flags read 0x104 while disarmed (bits 2+8; box id 2 is HORIZON, matching the OSD's
+            // "HOR" mode field at that moment) -- which confirms this offset and bit numbering.
+            if ((cmd == 101 || cmd == 150) && plen >= 10) {
+                uint32_t f = (uint32_t)b[ps + 6] | ((uint32_t)b[ps + 7] << 8)
+                           | ((uint32_t)b[ps + 8] << 16) | ((uint32_t)b[ps + 9] << 24);
+                int now = (f & 1u) ? 1 : 0;
+                int prev = armed.exchange(now);
+                if (prev != now) {
+                    fprintf(stderr, "MSP: %s (flags=0x%08x)\n", now ? "ARMED" : "DISARMED", f);
+                    fflush(stderr);
+                    gen.fetch_add(1);
+                }
+            }
+            i = ps + plen + 1;
         }
     }
 };
-static void applyColortrans(AVFrame* f, const ColortransLut& lut) {
-    for (int y = 0; y < f->height; y++) {
-        uint8_t* row = f->data[0] + y * f->linesize[0];
-        for (int x = 0; x < f->width; x++) row[x] = lut.y[row[x]];
-    }
-    int cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
-    for (int p = 1; p <= 2; p++) {
-        for (int y = 0; y < ch; y++) {
-            uint8_t* row = f->data[p] + y * f->linesize[p];
-            for (int x = 0; x < cw; x++) row[x] = lut.c[row[x]];
-        }
-    }
-}
 
 int main(int argc, char** argv)
 {
+    // Dev/test-only hook: exercise reencodeWithOvershootFix directly on an existing recording,
+    // no SDL/GUI/live-stream needed. Not part of the normal app flow.
+    if (argc >= 3 && std::string(argv[1]) == "--reencode-test") {
+        ColortransLut lut; lut.build(2.5f, -0.15f);
+        reencodeWithOvershootFix(argv[2], lut);
+        return 0;
+    }
     std::string dir = exeDir();
     std::string sdpPath = dir + APFPV_PATH_SEP + "apfpv_h265.sdp";
 
@@ -662,10 +967,16 @@ int main(int argc, char** argv)
     // current renderer output size (the window is resizable/fullscreen-desktop, so it isn't a
     // fixed logical size) so it stays pinned to the top-right corner.
     SDL_Rect ctBtn{ 0, 44, 160, 60 };
-    CachedText statLineText, recBtnText, ctBtnText;
+    // AUTO button: sits under REC (top-left). When on, ARM starts recording and DISARM stops it,
+    // so a clip is exactly one flight instead of the whole session.
+    SDL_Rect autoBtn{ 12, 112, 160, 60 };
+    CachedText statLineText, recBtnText, ctBtnText, autoBtnText;
     ColortransLut ctLut;
     ctLut.build(2.5f, -0.15f);
     bool overshootFixEnabled = false;
+    bool autoRecordEnabled = false;
+    MspArmWatcher msp;
+    uint32_t lastArmGen = 0;
 
     RecordState rec;
     bool running = true;
@@ -710,7 +1021,7 @@ int main(int argc, char** argv)
                        recBtn.x, recBtn.y, recBtn.w, recBtn.h, hit);
                 fflush(stdout);
                 if (hit) {
-                    if (rec.recording) stopRecording(rec);
+                    if (rec.recording) stopRecording(rec, overshootFixEnabled);
                     else startRecording(rec, dir, fmt, videoStream);
                 }
                 bool ctHit = SDL_PointInRect(&p, &ctBtn);
@@ -719,6 +1030,26 @@ int main(int argc, char** argv)
                     printf("Overshoot Fix -> %s\n", overshootFixEnabled ? "ON" : "OFF");
                     fflush(stdout);
                 }
+                if (SDL_PointInRect(&p, &autoBtn)) {
+                    autoRecordEnabled = !autoRecordEnabled;
+                    if (autoRecordEnabled) { msp.start(); lastArmGen = msp.gen.load(); }
+                    else                   { msp.stop(); }
+                    printf("Auto record (on arm) -> %s%s\n", autoRecordEnabled ? "ON" : "OFF",
+                           autoRecordEnabled ? "  [needs msposd -d -o <thisPC>:14550 on the VTX]" : "");
+                    fflush(stdout);
+                }
+            }
+        }
+
+        // Act on ARM/DISARM edges. Done here (not in the socket thread) so recording start/stop
+        // stays on the same thread that owns fmt/rec, exactly like the REC button path.
+        if (autoRecordEnabled) {
+            uint32_t g = msp.gen.load();
+            if (g != lastArmGen) {
+                lastArmGen = g;
+                bool nowArmed = msp.armed.load() == 1;
+                if (nowArmed && !rec.recording)      startRecording(rec, dir, fmt, videoStream);
+                else if (!nowArmed && rec.recording) stopRecording(rec, overshootFixEnabled);
             }
         }
 
@@ -954,6 +1285,19 @@ int main(int argc, char** argv)
         drawTextCached(ren, font, ctBtnText, overshootFixEnabled ? "O.FIX ON" : "O.FIX", ctBtn.x + 16, ctBtn.y + 18,
                        SDL_Color{ 255, 255, 255, 255 });
 
+        // AUTO: green when enabled. Label reflects the live arm state once MSP is flowing, so it
+        // doubles as a "is telemetry actually arriving?" indicator -- "AUTO --" means enabled but
+        // no MSP_STATUS seen yet (msposd missing -d/-o, or the IP route isn't up).
+        SDL_SetRenderDrawColor(ren, autoRecordEnabled ? 30 : 60, autoRecordEnabled ? 160 : 60, 60, 220);
+        SDL_RenderFillRect(ren, &autoBtn);
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_RenderDrawRect(ren, &autoBtn);
+        const char* autoLbl = !autoRecordEnabled ? "AUTO"
+                            : (msp.armed.load() < 0 ? "AUTO --"
+                            : (msp.armed.load() == 1 ? "AUTO ARM" : "AUTO OFF"));
+        drawTextCached(ren, font, autoBtnText, autoLbl, autoBtn.x + 12, autoBtn.y + 18,
+                       SDL_Color{ 255, 255, 255, 255 });
+
         STEP(STEP_RENDER_PRESENT);
         {
             long long __t0 = nowMs();
@@ -963,7 +1307,8 @@ int main(int argc, char** argv)
         }
     }
 
-    stopRecording(rec);   // signals any still-active session to stop
+    msp.stop();   // join the MSP listener before we start tearing down
+    stopRecording(rec, overshootFixEnabled);   // signals any still-active session to stop
     for (auto& t : g_writerThreads) if (t.joinable()) t.join();   // let every writer finish/finalize before exit
 
     if (sws) sws_freeContext(sws);
