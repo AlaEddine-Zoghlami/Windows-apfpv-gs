@@ -642,7 +642,19 @@ int main(int argc, char** argv)
         }
 
         STEP(STEP_READ_FRAME);
-        int rc = av_read_frame(fmt, pkt);
+        // fmt can be null here after a PRIOR reconnect attempt itself failed
+        // (openInput() returned nullptr below, and the previous fmt was
+        // already closed) -- av_read_frame(NULL, ...) is undefined behavior,
+        // not a documented-safe no-op, so this must be checked explicitly
+        // rather than assumed harmless. Treat it exactly like any other read
+        // failure: fall straight into the reconnect-retry branch.
+        int rc = -1;
+        if (fmt) {
+            long long __t0 = nowMs();
+            rc = av_read_frame(fmt, pkt);
+            long long __dt = nowMs() - __t0;
+            if (__dt > 15) fprintf(stderr, "[trace] av_read_frame took %lldms\n", __dt);
+        }
         if (rc >= 0) {
             ioNotedProgress();
             if (pkt->stream_index == videoStream && waitingForKeyframe && (pkt->flags & AV_PKT_FLAG_KEY)) {
@@ -665,7 +677,10 @@ int main(int argc, char** argv)
                         if (frame->format == APFPV_HWACCEL_PIXFMT) {
                             STEP(STEP_HW_TRANSFER);
                             av_frame_unref(hwSwFrame);
-                            if (av_hwframe_transfer_data(hwSwFrame, frame, 0) < 0) {
+                            long long __t0 = nowMs();
+                            int __hwrc = av_hwframe_transfer_data(hwSwFrame, frame, 0);
+                            { long long __dt = nowMs() - __t0; if (__dt > 15) fprintf(stderr, "[trace] av_hwframe_transfer_data took %lldms (rc=%d)\n", __dt, __hwrc); }
+                            if (__hwrc < 0) {
                                 av_frame_unref(frame);
                                 STEP(STEP_RECEIVE_FRAME);
                                 continue;
@@ -713,13 +728,23 @@ int main(int argc, char** argv)
                             av_frame_get_buffer(frameYuv, 32);
                         }
                         STEP(STEP_SWS_SCALE);
-                        sws_scale(sws, useFrame->data, useFrame->linesize, 0, useFrame->height,
-                                  frameYuv->data, frameYuv->linesize);
+                        {
+                            long long __t0 = nowMs();
+                            sws_scale(sws, useFrame->data, useFrame->linesize, 0, useFrame->height,
+                                      frameYuv->data, frameYuv->linesize);
+                            long long __dt = nowMs() - __t0;
+                            if (__dt > 15) fprintf(stderr, "[trace] sws_scale took %lldms\n", __dt);
+                        }
                         STEP(STEP_SDL_UPDATETEX);
-                        SDL_UpdateYUVTexture(tex, NULL,
-                                             frameYuv->data[0], frameYuv->linesize[0],
-                                             frameYuv->data[1], frameYuv->linesize[1],
-                                             frameYuv->data[2], frameYuv->linesize[2]);
+                        {
+                            long long __t0 = nowMs();
+                            SDL_UpdateYUVTexture(tex, NULL,
+                                                 frameYuv->data[0], frameYuv->linesize[0],
+                                                 frameYuv->data[1], frameYuv->linesize[1],
+                                                 frameYuv->data[2], frameYuv->linesize[2]);
+                            long long __dt = nowMs() - __t0;
+                            if (__dt > 15) fprintf(stderr, "[trace] SDL_UpdateYUVTexture took %lldms\n", __dt);
+                        }
                         frameCount++;
                         g_frameCounter.fetch_add(1, std::memory_order_relaxed);
                         STEP(STEP_UNREF_FRAME);
@@ -841,7 +866,12 @@ int main(int argc, char** argv)
                        SDL_Color{ 255, 255, 255, 255 });
 
         STEP(STEP_RENDER_PRESENT);
-        SDL_RenderPresent(ren);
+        {
+            long long __t0 = nowMs();
+            SDL_RenderPresent(ren);
+            long long __dt = nowMs() - __t0;
+            if (__dt > 15) fprintf(stderr, "[trace] SDL_RenderPresent took %lldms\n", __dt);
+        }
     }
 
     stopRecording(rec);   // signals any still-active session to stop
