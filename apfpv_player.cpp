@@ -1253,12 +1253,31 @@ struct OsdRenderer {
     uint32_t lastGen = 0xffffffffu;
     bool ready = false;
 
-    bool init(SDL_Renderer* ren, const std::string& fontPath) {
+    bool init(SDL_Renderer* ren, const std::string& fontDir) {
         int fw = 0, fh = 0;
-        if (!decodeImageRGBA(fontPath.c_str(), atlasRGBA, fw, fh)) {
-            fprintf(stderr, "OSD: font atlas '%s' not found/decodable -- ground OSD disabled\n", fontPath.c_str());
+        // Font is selectable by dropping a file in fonts/. Anything using the standard
+        // Betaflight/INAV/WTFOS atlas layout (4 pages across x 256 glyph rows) works, including the
+        // higher-resolution WTFOS/HD sets -- glyph size is DERIVED from the image dimensions rather
+        // than hardcoded, so a 24x36 or 48x72 atlas needs no code change. font_custom.png wins if
+        // present, so a downloaded font can be tried without touching the shipped one.
+        const char* names[] = { "font_custom.png", "font_btfl.png", "font_inav.png", "font_ardu.png" };
+        std::string used;
+        for (const char* n : names) {
+            std::string p = fontDir + APFPV_PATH_SEP + n;
+            if (decodeImageRGBA(p.c_str(), atlasRGBA, fw, fh)) { used = n; break; }
+        }
+        if (used.empty()) {
+            fprintf(stderr, "OSD: no usable font atlas in '%s' (tried font_custom/btfl/inav/ardu.png)"
+                            " -- ground OSD disabled\n", fontDir.c_str());
             return false;
         }
+        // Sanity-check the layout so a non-atlas PNG can't produce nonsense glyph rects.
+        if (fw % 4 || fh % 256 || fw / 4 < 8 || fh / 256 < 8) {
+            fprintf(stderr, "OSD: '%s' is %dx%d, which is not a 4-page x 256-row glyph atlas"
+                            " -- ground OSD disabled\n", used.c_str(), fw, fh);
+            return false;
+        }
+        fprintf(stderr, "OSD: using font %s\n", used.c_str());
         atlas = mspospd::makeAtlas(atlasRGBA.data(), fw, fh);
         mspospd::canvasSizeFor(atlas.glyphW, cols, rows);
         texW = cols * atlas.glyphW; texH = rows * atlas.glyphH;
@@ -1457,7 +1476,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "aalink stats: polling http://%s/aalink_ext.msg\n", vtx.c_str());
     }
     OsdRenderer osdR;
-    bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts" + APFPV_PATH_SEP + "font_btfl.png");
+    bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts");
     SDL_Rect osdBtn{ 12, 180, 160, 60 };
     CachedText osdBtnText;
 
