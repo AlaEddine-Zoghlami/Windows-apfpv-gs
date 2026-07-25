@@ -793,18 +793,24 @@ static void startRecording(RecordState& rs, const std::string& dir, AVFormatCont
         // Second output: the same footage with the OSD burned in, written alongside the raw file
         // as <name>_osd.ts. The raw recording itself stays an untouched lossless remux -- that is
         // the whole point of moving the OSD off the VTX, so "raw" really is raw.
-        if (session->wantOsdCopy) {
-            std::string osdOut = session->outPath;
-            size_t dot = osdOut.find_last_of('.');
-            osdOut = (dot == std::string::npos ? osdOut : osdOut.substr(0, dot)) + "_osd.ts";
-            ColortransLut lut2; lut2.build(2.5f, -0.15f);
-            reencodeWithOsd(session->outPath, osdOut, session->osdTimeline,
-                            session->applyOvershootFix ? &lut2 : nullptr);
-        }
+        // ORDER MATTERS. The raw file is the primary artefact, so correct it FIRST and let the
+        // optional OSD copy come second. Doing the (roughly clip-length x2) OSD pass first meant
+        // the raw file's Overshoot Fix was the LAST thing to run and so the first casualty if the
+        // app was closed mid-pass -- which looked exactly like "the fix was never applied".
+        // Deriving the OSD copy from the already-corrected raw also drops a whole LUT application
+        // and guarantees the two files match colour-wise.
         if (session->applyOvershootFix) {
             ColortransLut lut;
             lut.build(2.5f, -0.15f);
             reencodeWithOvershootFix(session->outPath, lut);
+        }
+        // Second output: same footage with the OSD burned in, alongside the raw file. Source is the
+        // raw file as it now stands, so if Overshoot Fix ran above this inherits it -- no second LUT.
+        if (session->wantOsdCopy) {
+            std::string osdOut = session->outPath;
+            size_t dot = osdOut.find_last_of('.');
+            osdOut = (dot == std::string::npos ? osdOut : osdOut.substr(0, dot)) + "_osd.ts";
+            reencodeWithOsd(session->outPath, osdOut, session->osdTimeline, nullptr);
         }
     });   // Deliberately NOT detached -- see the comment on g_writerThreads above. Detaching made
           // joinable() false, so the join loop at shutdown did nothing and the OS killed this
