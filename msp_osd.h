@@ -58,6 +58,12 @@ public:
     void write(int row, int col, uint8_t attr, const uint8_t* g, int n) {
         if (row < 0 || row >= MAX_ROWS) return;
         std::lock_guard<std::mutex> lk(m_);
+        // Track the real extents the FC actually addresses. The canvas grid is a property of the
+        // DISPLAYPORT STREAM, not of whichever font atlas we happen to render with -- deriving it
+        // from the font put every glyph in the wrong cell as soon as a different-resolution atlas
+        // (e.g. an HD/WTFOS one) was used.
+        if (row > maxRow_) maxRow_ = row;
+        if (col + n - 1 > maxCol_) maxCol_ = col + n - 1;
         // Betaflight's page bits live in the attr byte. Mask to the 2 bits our
         // 4-page atlas can address so a stray high bit can't index out of range.
         uint8_t page = (uint8_t)(attr & 0x03);
@@ -77,6 +83,16 @@ public:
 
     uint32_t generation() const { return gen_.load(std::memory_order_acquire); }
 
+    // Grid actually in use, inferred from the coordinates the FC has addressed. Betaflight uses
+    // 53x20 (SD/"matrix 0") or 50x18 (HD/"matrix 1"); anything beyond col 49 or row 17 can only be
+    // the larger grid. Defaults to the SD grid until enough has been seen.
+    void gridSize(int& cols, int& rows) const {
+        std::lock_guard<std::mutex> lk(m_);
+        cols = (maxCol_ >= 50) ? 53 : 50;
+        rows = (maxRow_ >= 18) ? 20 : 18;
+        if (maxCol_ < 0) { cols = 53; rows = 20; }
+    }
+
     // Copy the published canvas out for rendering (cheap: ~1.5 KB).
     void snapshot(Cell out[MAX_ROWS][MAX_COLS]) const {
         std::lock_guard<std::mutex> lk(m_);
@@ -85,6 +101,7 @@ public:
 
 private:
     mutable std::mutex m_;
+    int maxRow_ = -1, maxCol_ = -1;
     Cell back_[MAX_ROWS][MAX_COLS]{};
     Cell front_[MAX_ROWS][MAX_COLS]{};
     std::atomic<uint32_t> gen_{ 0 };

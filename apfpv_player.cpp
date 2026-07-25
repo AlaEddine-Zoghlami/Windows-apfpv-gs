@@ -315,6 +315,7 @@ struct OsdSnapshot {
 
 // The OSD composite pass runs on the writer thread after recording stops, so the atlas has to be
 // reachable from there rather than living only inside the renderer.
+static int g_osdCols = 53, g_osdRows = 20;   // grid the FC addresses; set from the live canvas
 static std::vector<uint8_t> g_atlasRGBA;
 static mspospd::FontAtlas   g_atlas;
 
@@ -347,24 +348,32 @@ static void applyColortrans(AVFrame* f, const ColortransLut& lut) {
 static void compositeOsdOnFrame(AVFrame* f, const OsdSnapshot& snap, int cols, int rows) {
     if (!g_atlas.valid() || f->format != AV_PIX_FMT_YUV420P) return;
     const int gw = g_atlas.glyphW, gh = g_atlas.glyphH;
-    // The canvas (53*36 = 1908) is narrower than 1920, so centre it exactly as the VTX overlay sat.
-    const int xoff = (f->width - cols * gw) / 2;
-    const int yoff = (f->height - rows * gh) / 2;
+    // Cell size comes from the VIDEO, not the atlas: the canvas must fill the frame the same way
+    // regardless of font resolution. Drawing at the atlas's native size only happened to look right
+    // for the SD font (53*36 = 1908 ~ 1920); an HD atlas (53*24 = 1272) shrank the whole overlay
+    // toward the centre. Glyphs are nearest-neighbour scaled into the cell, so a higher-resolution
+    // font gives crisper output at identical positions.
+    const int cellW = f->width / cols, cellH = f->height / rows;
+    if (cellW <= 0 || cellH <= 0) return;
+    const int xoff = (f->width - cellW * cols) / 2;
+    const int yoff = (f->height - cellH * rows) / 2;
     for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) {
         const mspospd::Cell cell = snap.cells[r][c];
         if (!cell.glyph) continue;
         int sx, sy, sw, sh; g_atlas.srcRect(cell.glyph, cell.page, sx, sy, sw, sh);
         if (sy + sh > g_atlas.h) continue;
-        for (int y = 0; y < sh; y++) {
-            int dy = yoff + r * gh + y;
+        for (int y = 0; y < cellH; y++) {
+            int dy = yoff + r * cellH + y;
             if (dy < 0 || dy >= f->height) continue;
-            const uint8_t* srow = g_atlasRGBA.data() + ((size_t)(sy + y) * g_atlas.w + sx) * 4;
+            const int gy = y * gh / cellH;                  // nearest-neighbour scale into the cell
+            const uint8_t* srow = g_atlasRGBA.data() + ((size_t)(sy + gy) * g_atlas.w + sx) * 4;
             uint8_t* yrow = f->data[0] + (ptrdiff_t)dy * f->linesize[0];
-            for (int x = 0; x < sw; x++) {
-                if (!srow[x * 4 + 3]) continue;             // transparent atlas pixel
-                int dx = xoff + c * gw + x;
+            for (int x = 0; x < cellW; x++) {
+                const int gx = x * gw / cellW;
+                if (!srow[gx * 4 + 3]) continue;            // transparent atlas pixel
+                int dx = xoff + c * cellW + x;
                 if (dx < 0 || dx >= f->width) continue;
-                int R = srow[x * 4 + 0], G = srow[x * 4 + 1], B = srow[x * 4 + 2];
+                int R = srow[gx * 4 + 0], G = srow[gx * 4 + 1], B = srow[gx * 4 + 2];
                 int Y = (int)(0.2126 * R + 0.7152 * G + 0.0722 * B);
                 yrow[dx] = (uint8_t)(Y < 0 ? 0 : (Y > 255 ? 255 : Y));
                 // Chroma is half resolution; writing it once per 2x2 is visually identical here
@@ -556,7 +565,7 @@ static void reencodePass(const std::string& inPath, const std::string& outPath,
                                               AVRational{ 1, 1000 });
             size_t idx = 0;
             while (idx + 1 < timeline->size() && (*timeline)[idx + 1].tMs <= tMs) idx++;
-            int ccols, crows; mspospd::canvasSizeFor(g_atlas.glyphW, ccols, crows);
+            int ccols = g_osdCols, crows = g_osdRows;
             compositeOsdOnFrame(useFrame, (*timeline)[idx], ccols, crows);
         }
         int sendErr = avcodec_send_frame(encCtx, useFrame);
@@ -1279,7 +1288,7 @@ struct OsdRenderer {
         }
         fprintf(stderr, "OSD: using font %s\n", used.c_str());
         atlas = mspospd::makeAtlas(atlasRGBA.data(), fw, fh);
-        mspospd::canvasSizeFor(atlas.glyphW, cols, rows);
+        cols = 53; rows = 20;                       // provisional; corrected from the stream below
         texW = cols * atlas.glyphW; texH = rows * atlas.glyphH;
         SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(atlasRGBA.data(), fw, fh, 32, fw * 4,
                                                             SDL_PIXELFORMAT_ABGR8888);
@@ -1303,6 +1312,21 @@ struct OsdRenderer {
         uint32_t g = cv.generation();
         if (g == lastGen) return;
         lastGen = g;
+        // Adopt the grid the FC is actually addressing, and resize the target texture if it
+        // changed. Glyphs are drawn one-per-cell at atlas resolution; the whole texture is then
+        // scaled onto the video rect, so a higher-resolution font simply yields crisper glyphs
+        // rather than displacing them.
+        int ncols, nrows; cv.gridSize(ncols, nrows);
+        if (ncols != cols || nrows != rows) {
+            cols = ncols; rows = nrows;
+            texW = cols * atlas.glyphW; texH = rows * atlas.glyphH;
+            if (canvasTex) SDL_DestroyTexture(canvasTex);
+            canvasTex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, texW, texH);
+            if (!canvasTex) { ready = false; return; }
+            SDL_SetTextureBlendMode(canvasTex, SDL_BLENDMODE_BLEND);
+            g_osdCols = cols; g_osdRows = rows;
+            fprintf(stderr, "OSD: grid from stream = %dx%d cells (%dx%d px)\n", cols, rows, texW, texH);
+        }
         mspospd::Cell cells[mspospd::MAX_ROWS][mspospd::MAX_COLS];
         cv.snapshot(cells);
         SDL_Texture* prev = SDL_GetRenderTarget(ren);
