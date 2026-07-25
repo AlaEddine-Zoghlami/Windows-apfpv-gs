@@ -33,6 +33,7 @@ extern "C" {
 #include <atomic>
 #include <memory>
 #include <vector>
+#include <cmath>
 
 #ifdef _WIN32
   #define APFPV_PATH_SEP       "\\"
@@ -546,6 +547,38 @@ static void drawTextCached(SDL_Renderer* ren, TTF_Font* font, CachedText& cache,
     SDL_RenderCopy(ren, cache.tex, NULL, &dst);
 }
 
+// OpenIPC "Overshoot Fix" colortrans reversal, ported from PixelPilot's Android GL shader
+// (GLFanoutRenderer.h): rev = clamp((rgb + offset) * gain, 0, 1), the identical affine transform
+// on R, G and B. Because all three channels get the same transform, it factors exactly into YUV
+// space -- Y' = gain*(Y+offset), U' = gain*(U-mid)+mid, V' = gain*(V-mid)+mid (mid = 128) -- so it
+// can be applied straight to the decoded YUV420P planes via an 8-bit lookup table, no RGB
+// round-trip needed. Defaults (gain 2.5, offset -0.15) match PixelPilot_rk/Android.
+struct ColortransLut {
+    uint8_t y[256], c[256];
+    void build(float gain, float offset) {
+        int off8 = (int)lrintf(offset * 255.0f);
+        for (int i = 0; i < 256; i++) {
+            int yv = (int)lrintf((i + off8) * gain);
+            y[i] = (uint8_t)(yv < 0 ? 0 : (yv > 255 ? 255 : yv));
+            int cv = (int)lrintf((i - 128) * gain) + 128;
+            c[i] = (uint8_t)(cv < 0 ? 0 : (cv > 255 ? 255 : cv));
+        }
+    }
+};
+static void applyColortrans(AVFrame* f, const ColortransLut& lut) {
+    for (int y = 0; y < f->height; y++) {
+        uint8_t* row = f->data[0] + y * f->linesize[0];
+        for (int x = 0; x < f->width; x++) row[x] = lut.y[row[x]];
+    }
+    int cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
+    for (int p = 1; p <= 2; p++) {
+        for (int y = 0; y < ch; y++) {
+            uint8_t* row = f->data[p] + y * f->linesize[p];
+            for (int x = 0; x < cw; x++) row[x] = lut.c[row[x]];
+        }
+    }
+}
+
 int main(int argc, char** argv)
 {
     std::string dir = exeDir();
@@ -625,7 +658,14 @@ int main(int argc, char** argv)
     // REC button geometry (top-left, below the FPS/res text line) -- sized
     // generously (a first attempt at 90x34 was missed in testing).
     SDL_Rect recBtn{ 12, 44, 160, 60 };
-    CachedText statLineText, recBtnText;
+    // Overshoot Fix button (top-right, mirrors recBtn). x is recomputed every frame from the
+    // current renderer output size (the window is resizable/fullscreen-desktop, so it isn't a
+    // fixed logical size) so it stays pinned to the top-right corner.
+    SDL_Rect ctBtn{ 0, 44, 160, 60 };
+    CachedText statLineText, recBtnText, ctBtnText;
+    ColortransLut ctLut;
+    ctLut.build(2.5f, -0.15f);
+    bool overshootFixEnabled = false;
 
     RecordState rec;
     bool running = true;
@@ -645,6 +685,11 @@ int main(int argc, char** argv)
 
     while (running) {
         STEP(STEP_LOOP_TOP);
+        {
+            int outW, outH;
+            SDL_GetRendererOutputSize(ren, &outW, &outH);
+            ctBtn.x = outW - ctBtn.w - 12;
+        }
         SDL_Event e;
         STEP(STEP_POLL_EVENTS);
         while (SDL_PollEvent(&e)) {
@@ -667,6 +712,12 @@ int main(int argc, char** argv)
                 if (hit) {
                     if (rec.recording) stopRecording(rec);
                     else startRecording(rec, dir, fmt, videoStream);
+                }
+                bool ctHit = SDL_PointInRect(&p, &ctBtn);
+                if (ctHit) {
+                    overshootFixEnabled = !overshootFixEnabled;
+                    printf("Overshoot Fix -> %s\n", overshootFixEnabled ? "ON" : "OFF");
+                    fflush(stdout);
                 }
             }
         }
@@ -765,6 +816,7 @@ int main(int argc, char** argv)
                             long long __dt = nowMs() - __t0;
                             if (__dt > 15) fprintf(stderr, "[trace] sws_scale took %lldms\n", __dt);
                         }
+                        if (overshootFixEnabled) applyColortrans(frameYuv, ctLut);
                         STEP(STEP_SDL_UPDATETEX);
                         {
                             long long __t0 = nowMs();
@@ -893,6 +945,13 @@ int main(int argc, char** argv)
         SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
         SDL_RenderDrawRect(ren, &recBtn);
         drawTextCached(ren, font, recBtnText, rec.recording ? "REC ||" : "REC", recBtn.x + 20, recBtn.y + 18,
+                       SDL_Color{ 255, 255, 255, 255 });
+
+        SDL_SetRenderDrawColor(ren, overshootFixEnabled ? 30 : 60, overshootFixEnabled ? 160 : 60, 60, 220);
+        SDL_RenderFillRect(ren, &ctBtn);
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_RenderDrawRect(ren, &ctBtn);
+        drawTextCached(ren, font, ctBtnText, overshootFixEnabled ? "O.FIX ON" : "O.FIX", ctBtn.x + 16, ctBtn.y + 18,
                        SDL_Color{ 255, 255, 255, 255 });
 
         STEP(STEP_RENDER_PRESENT);
