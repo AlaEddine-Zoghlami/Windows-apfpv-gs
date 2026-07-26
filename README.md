@@ -29,6 +29,25 @@ client, and these tools handle the video, OSD, telemetry, and link feedback.
 - `lqfeedback_cli.cpp` — sends live RSSI to the VTX's aalink link-quality
   service as UDP feedback (Windows-only tool; uses `wlanapi.h`).
 
+## Features
+
+- **Dual video recording (raw + OSD).** The REC button writes an untouched,
+  lossless remux of the stream (`<name>.ts`) and, alongside it, a second copy
+  with the OSD burned in (`<name>_osd.ts`) — derived from the corrected raw so
+  it inherits the Overshoot-Fix LUT exactly once. "Raw" really is raw, because
+  the OSD is composited on the ground, not baked in by the VTX.
+- **Custom OSD fonts.** The ground-side OSD renders from a Betaflight glyph
+  atlas in `fonts/`. Drop in a `font_custom.png` to override (it wins over the
+  bundled `font_btfl.png` / `font_inav.png` / `font_ardu.png`); any atlas glyph
+  size auto-scales, so a 24×36 or 48×72 HD atlas needs no code change.
+- **Voice alerts (audio).** OpenTX/EdgeTX-style spoken alerts built from
+  concatenated clips (the EdgeTX pack in `sounds/`): arm/disarm, battery
+  voltage/level, and link-quality warnings, driven by an edge-triggered rule
+  table (`apfpv_sounds.conf`) reading the arm bit and OSD-scraped values.
+- **MSP OSD + aalink line over the link.** Renders the Betaflight/MSP OSD (from
+  msposd `-d -o <thisPC>:14550`) and the aalink stats line (from the VTX
+  `aalink_udp` relay on UDP 14551) over the live video.
+
 ## Prebuilt downloads
 
 Each tagged release ships a self-contained archive per platform (binary +
