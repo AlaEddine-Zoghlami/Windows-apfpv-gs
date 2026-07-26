@@ -1,0 +1,150 @@
+name: build
+
+# Builds the ground station on every target we support. The point is to catch the
+# platform-specific code that cannot be compiled on a dev machine: the Linux
+# (/proc/net/wireless) and macOS (CoreWLAN, Objective-C++) WifiLink backends were
+# written without ever being built, so CI is what actually verifies them.
+on:
+  push:
+    branches: [ master, main, 'feat/**' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------- Linux x64
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libsdl2-dev libsdl2-ttf-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build -j"$(nproc)"
+      # A binary that links is not proof the assets resolve. --help style smoke
+      # tests are not available here (the player opens a window), so instead check
+      # CMake actually staged everything the player loads relative to itself --
+      # a missing .sdp made it exit before audio init during development.
+      - name: assets staged next to the binary
+        run: |
+          test -x build/apfpv_player
+          test -d build/fonts
+          test -d build/sounds
+          test -f build/apfpv_sounds.conf
+          ls build/sounds/num/0000.wav
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-linux-x64
+          path: |
+            build/apfpv_player
+            build/osd_render_test
+
+  # -------------------------------------------------------------- Linux arm64
+  # Cross-compiled in an arm64 container rather than with a toolchain file, so the
+  # arm64 SDL2/FFmpeg packages are the real ones rather than hand-pointed paths.
+  linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: build in arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src debian:bookworm bash -euxc '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake pkg-config \
+                libsdl2-dev libsdl2-ttf-dev \
+                libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+              cmake -B build-arm64 -DCMAKE_BUILD_TYPE=Release
+              cmake --build build-arm64 -j"$(nproc)"
+              test -x build-arm64/apfpv_player
+              test -d build-arm64/sounds
+              test -f build-arm64/apfpv_sounds.conf
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-linux-arm64
+          path: build-arm64/apfpv_player
+
+  # --------------------------------------------------------------- macOS arm64
+  # macos-14+ runners are Apple silicon, so this is a native arm64 build and the
+  # only place WifiLinkMac.mm (CoreWLAN, Objective-C++) is ever compiled.
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: brew install cmake pkg-config sdl2 sdl2_ttf ffmpeg
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: verify arch and assets
+        run: |
+          lipo -archs build/apfpv_player
+          test -d build/sounds && test -f build/apfpv_sounds.conf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-macos-arm64
+          path: build/apfpv_player
+
+  # ------------------------------------------------------------------ Windows
+  # MSYS2/mingw64 to match how this project is built locally, so the CI compiler
+  # and the developer compiler are the same one.
+  windows-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL2_ttf
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-make
+      - name: configure
+        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build -j
+      - name: verify targets and assets
+        run: |
+          test -f build/apfpv_player.exe
+          test -f build/lqfeedback_cli.exe   # Windows-only tools must build here
+          test -f build/apfpv_watch.exe
+          test -d build/sounds
+      # Ship the mingw runtime DLLs alongside the exe: they are deliberately
+      # .gitignore'd (they belong to the packager, not the repo), so the artifact
+      # is where they get bundled.
+      - name: bundle runtime DLLs
+        run: |
+          cd build
+          for f in apfpv_player.exe lqfeedback_cli.exe; do
+            ldd $f | awk '/mingw64/{print $3}' | sort -u | xargs -r -I{} cp -n {} . || true
+          done
+          ls *.dll | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-windows-x64
+          path: |
+            build/*.exe
+            build/*.dll
+            build/fonts
+            build/sounds
+            build/apfpv_sounds.conf

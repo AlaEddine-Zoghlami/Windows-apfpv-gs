@@ -1,15 +1,25 @@
-# Build outputs (rebuild via the commands in README.md)
+# build output
+build/
+build-*/
 *.exe
-*.dll
 *.o
 *.obj
 
-# Recordings and run-time logs/diagnostics
+# prebuilt runtime DLLs come from MSYS2/the packager, not the repo
+*.dll
+
+# per-machine UI toggles, written at runtime
+apfpv_settings.ini
+
+# recordings
 apfpv_rec_*.ts
-watchdog_log*.txt
-memory_timeline*.txt
-monitor_pid.txt
-rebuild_log*.txt
-isolate_err.txt
-player_*.txt
-watch_*.txt
+apfpv_rec_*.mp4
+records/
+
+# scratch logs and captures. Blanket *.txt because this tree accumulates debug
+# dumps (player_*_err.txt, memory_timeline.txt, ...); CMakeLists.txt is re-added
+# explicitly since it shares the extension.
+*.txt
+!CMakeLists.txt
+*.log
+*.bin
