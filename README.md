@@ -31,9 +31,10 @@ client, and these tools handle the video, OSD, telemetry, and link feedback.
 
 ## Features
 
-> **VTX prerequisite.** The ground-drawn OSD, the MSP/aalink overlays, and the
-> dual raw+OSD recording require the air unit in **ground mode** — streaming
-> *clean* video while forwarding MSP (UDP 14550) and pushing aalink (UDP 14551).
+> **VTX prerequisite.** The ground-drawn OSD, the MSP/aalink overlays, the dual
+> raw+OSD recording, **and audio playback** require the air unit in **ground
+> mode** — streaming *clean* video while forwarding MSP (UDP 14550) and pushing
+> aalink (UDP 14551).
 > Set that up with [**apfpv-vtx**](https://github.com/GingerFluffyCat/apfpv-vtx)
 > (`vtx-osd-mode.sh ground` + the `aalink_udp` relay); it installs the
 > forward-capable msposd and reverts with `vtx-osd-mode.sh stock`. Without it the
