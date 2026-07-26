@@ -1275,6 +1275,46 @@ struct AalinkStats {
         });
     }
 
+    // UDP mode: the VTX pushes /tmp/aalink_ext.msg over UDP (aalink_udp relay) to this port.
+    // Preferred over HTTP on the dongle path, where the TCP uplink to the VTX is dead so the
+    // HTTP GET never completes. The payload is the same key=value text parse() already handles.
+    void startUdp(int port) {
+        if (run.exchange(true)) return;
+        th = std::thread([this, port]() {
+#ifdef _WIN32
+            WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+#endif
+            int sock = (int)::socket(AF_INET, SOCK_DGRAM, 0);
+            if (sock < 0) { run.store(false); return; }
+            sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY;
+            a.sin_port = htons((unsigned short)port);
+#ifdef _WIN32
+            DWORD tv = 1000; ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+            timeval tv{1,0}; ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
+            if (::bind(sock, (sockaddr*)&a, sizeof(a)) == 0) {
+                fprintf(stderr, "aalink: listening on UDP %d\n", port);
+                char buf[2048];
+                while (run.load()) {
+                    int n = ::recvfrom(sock, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
+                    if (n > 0) {
+                        buf[n] = 0; parse(buf); lastOkMs.store(nowMs());
+                        static int dbg = 0;
+                        if ((dbg++ % 10) == 0)
+                            fprintf(stderr, "aalink(udp): up=%d%% dn=%d%% mcs=%d kbps=%d bw=%d ch=%d\n",
+                                    up.load(), down.load(), mcs.load(), kbps.load(), bw.load(), ch.load());
+                    }
+                }
+            }
+#ifdef _WIN32
+            ::closesocket(sock);
+#else
+            ::close(sock);
+#endif
+        });
+    }
+
     void parse(const char* s) {
         auto grab = [&](const char* key, std::atomic<int>& dst) {
             // Match at a line start so "rssi_udp" can never be found inside another key.
@@ -1608,7 +1648,12 @@ int main(int argc, char** argv)
     AalinkStats aalink;
     {
         std::string vtx = (argc > 1 && argv[1][0] != '-') ? argv[1] : "192.168.0.1";
-        aalink.start("http://root:12345@" + vtx + "/aalink_ext.msg");
+        // aalink over UDP (aalink_udp relay on the VTX pushes /tmp/aalink_ext.msg here). Works on
+        // the dongle where HTTP's TCP uplink is dead. APFPV_AALINK_HTTP=1 forces the old HTTP poll.
+        if (std::getenv("APFPV_AALINK_HTTP"))
+            aalink.start("http://root:12345@" + vtx + "/aalink_ext.msg");
+        else
+            aalink.startUdp(14551);
         fprintf(stderr, "aalink stats: polling http://%s/aalink_ext.msg\n", vtx.c_str());
     }
     OsdRenderer osdR;

@@ -7,8 +7,12 @@ name: build
 on:
   push:
     branches: [ master, main, 'feat/**' ]
+    tags: [ 'v[0-9]+.[0-9]+.[0-9]+' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   # ---------------------------------------------------------------- Linux x64
@@ -44,6 +48,9 @@ jobs:
           path: |
             build/apfpv_player
             build/osd_render_test
+            build/fonts
+            build/sounds
+            build/apfpv_sounds.conf
 
   # -------------------------------------------------------------- Linux arm64
   # Cross-compiled in an arm64 container rather than with a toolchain file, so the
@@ -73,7 +80,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: apfpv-gs-linux-arm64
-          path: build-arm64/apfpv_player
+          path: |
+            build-arm64/apfpv_player
+            build-arm64/fonts
+            build-arm64/sounds
+            build-arm64/apfpv_sounds.conf
 
   # --------------------------------------------------------------- macOS arm64
   # macos-14+ runners are Apple silicon, so this is a native arm64 build and the
@@ -95,7 +106,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: apfpv-gs-macos-arm64
-          path: build/apfpv_player
+          path: |
+            build/apfpv_player
+            build/fonts
+            build/sounds
+            build/apfpv_sounds.conf
 
   # ------------------------------------------------------------------ Windows
   # MSYS2/mingw64 to match how this project is built locally, so the CI compiler
@@ -148,3 +163,37 @@ jobs:
             build/fonts
             build/sounds
             build/apfpv_sounds.conf
+
+  # ------------------------------------------------------------------- Release
+  # On a version tag, gather every platform's build artifact, zip each into a
+  # self-contained archive (binary + fonts/sounds/conf, and the Windows runtime
+  # DLLs), and publish a GitHub release. Only runs for tag pushes so branch/PR
+  # builds still just produce artifacts.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ linux-x64, linux-arm64, macos-arm64, windows-x64 ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: package per-platform archives
+        run: |
+          cd dist
+          ls -la
+          for d in apfpv-gs-*; do
+            [ -d "$d" ] || continue
+            # normal, executable bit for the unix binaries (lost through the zip round-trip otherwise)
+            chmod +x "$d"/apfpv_player "$d"/osd_render_test 2>/dev/null || true
+            zip -r "../${d}-${GITHUB_REF_NAME}.zip" "$d"
+          done
+          cd ..
+          ls -la *.zip
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: APFPV Ground Station ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            *.zip
