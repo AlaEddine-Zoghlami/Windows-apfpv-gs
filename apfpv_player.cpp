@@ -24,7 +24,10 @@ extern "C" {
 #include <windows.h>
 #else
 #include <unistd.h>
-#include <linux/limits.h>
+// <limits.h>, not <linux/limits.h>: the latter is a Linux kernel header and does
+// not exist on macOS/BSD, which broke the very first macOS build. The portable
+// header provides PATH_MAX on every platform we target.
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>

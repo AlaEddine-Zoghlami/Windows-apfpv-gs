@@ -66,8 +66,9 @@ jobs:
                 libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
               cmake -B build-arm64 -DCMAKE_BUILD_TYPE=Release
               cmake --build build-arm64 -j"$(nproc)"
-              file build-arm64/apfpv_player
+              test -x build-arm64/apfpv_player
               test -d build-arm64/sounds
+              test -f build-arm64/apfpv_sounds.conf
             '
       - uses: actions/upload-artifact@v4
         with:
@@ -117,7 +118,7 @@ jobs:
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-SDL2_ttf
             mingw-w64-x86_64-ffmpeg
-            make
+            mingw-w64-x86_64-make
       - name: configure
         run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
       - name: build
