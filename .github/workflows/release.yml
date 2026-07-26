@@ -1,0 +1,213 @@
+name: release
+
+# Builds a distributable archive for every supported target and attaches them all
+# to a GitHub Release.
+#
+# Triggered by pushing a tag (v*), or manually via workflow_dispatch with a tag
+# name -- the manual path exists so a release can be re-cut without inventing a
+# new version number when only the packaging was wrong.
+#
+# Each archive is SELF-CONTAINED: binary + fonts/ + sounds/ + apfpv_sounds.conf +
+# the .sdp. The player loads all of those relative to its own executable, so an
+# archive missing any of them builds the illusion of a working download and then
+# fails at runtime -- which is exactly how the missing .sdp bit during development.
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0). Created if absent.'
+        required: true
+
+permissions:
+  contents: write        # needed to create the release and upload assets
+
+jobs:
+  # ---------------------------------------------------------------- Linux x64
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libsdl2-dev libsdl2-ttf-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+      - name: build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - name: package
+        run: |
+          d=apfpv-gs-linux-x64
+          mkdir -p "$d"
+          cp build/apfpv_player build/osd_render_test "$d"/
+          cp -r build/fonts build/sounds "$d"/
+          cp apfpv_sounds.conf apfpv_h265.sdp NOTICE.md "$d"/
+          tar czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-linux-x64
+          path: apfpv-gs-linux-x64.tar.gz
+
+  # -------------------------------------------------------------- Linux arm64
+  linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: build in arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src debian:bookworm bash -euxc '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake pkg-config \
+                libsdl2-dev libsdl2-ttf-dev \
+                libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+              cmake -B build-arm64 -DCMAKE_BUILD_TYPE=Release
+              cmake --build build-arm64 -j"$(nproc)"
+              test -x build-arm64/apfpv_player
+            '
+      - name: package
+        run: |
+          d=apfpv-gs-linux-arm64
+          mkdir -p "$d"
+          sudo cp build-arm64/apfpv_player build-arm64/osd_render_test "$d"/
+          sudo cp -r build-arm64/fonts build-arm64/sounds "$d"/
+          cp apfpv_sounds.conf apfpv_h265.sdp NOTICE.md "$d"/
+          sudo chown -R "$USER" "$d"
+          tar czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-linux-arm64
+          path: apfpv-gs-linux-arm64.tar.gz
+
+  # --------------------------------------------------------------- macOS arm64
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: brew install cmake pkg-config sdl2 sdl2_ttf ffmpeg
+      - name: build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: package
+        run: |
+          d=apfpv-gs-macos-arm64
+          mkdir -p "$d"
+          cp build/apfpv_player build/osd_render_test "$d"/
+          cp -r build/fonts build/sounds "$d"/
+          cp apfpv_sounds.conf apfpv_h265.sdp NOTICE.md "$d"/
+          # Homebrew deps are NOT bundled: dylib relocation (install_name_tool /
+          # dylibbundler) is a separate job from building, and shipping a half-fixed
+          # bundle that only runs on a machine with the same brew prefix would be
+          # worse than telling the user to `brew install sdl2 sdl2_ttf ffmpeg`.
+          echo "Requires: brew install sdl2 sdl2_ttf ffmpeg" > "$d/README-macos.txt"
+          tar czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-macos-arm64
+          path: apfpv-gs-macos-arm64.tar.gz
+
+  # ------------------------------------------------------------- Windows x64
+  windows-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL2_ttf
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-make
+            zip
+      - name: build
+        run: |
+          cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+      - name: package with runtime DLLs
+        run: |
+          d=apfpv-gs-windows-x64
+          mkdir -p "$d"
+          cp build/*.exe "$d"/
+          cp -r build/fonts build/sounds "$d"/
+          cp apfpv_sounds.conf apfpv_h265.sdp NOTICE.md "$d"/
+          # Windows gets a genuinely self-contained archive: walk each exe's
+          # dependencies transitively and copy every mingw64 DLL in, so the download
+          # runs without MSYS2 installed. ldd resolves recursively here, which is why
+          # a single pass suffices.
+          for f in "$d"/*.exe; do
+            ldd "$f" | awk '/mingw64/{print $3}' | sort -u | while read -r dll; do
+              [ -f "$dll" ] && cp -n "$dll" "$d"/ || true
+            done
+          done
+          echo "DLLs bundled: $(ls "$d"/*.dll | wc -l)"
+          zip -qr "$d.zip" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfpv-gs-windows-x64
+          path: apfpv-gs-windows-x64.zip
+
+  # -------------------------------------------------------------- the release
+  publish:
+    needs: [ linux-x64, linux-arm64, macos-arm64, windows-x64 ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: list what will be published
+        run: find dist -type f | sort
+      - name: resolve tag
+        id: tag
+        run: |
+          # push -> the tag that triggered it; workflow_dispatch -> the input.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: APFPV Ground Station ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: dist/**/*
+          body: |
+            Ground-station builds for all supported targets. Each archive is
+            self-contained apart from the noted system libraries: binary, OSD
+            fonts, EdgeTX voice clips, `apfpv_sounds.conf` and the RTP `.sdp`.
+
+            | archive | target | notes |
+            |---|---|---|
+            | `apfpv-gs-windows-x64.zip` | Windows x64 | mingw runtime DLLs bundled — runs as-is |
+            | `apfpv-gs-linux-x64.tar.gz` | Linux x64 | needs `libsdl2`, `libsdl2-ttf`, ffmpeg libs |
+            | `apfpv-gs-linux-arm64.tar.gz` | Linux arm64 | same; built in an arm64 container |
+            | `apfpv-gs-macos-arm64.tar.gz` | macOS arm64 (Apple silicon) | `brew install sdl2 sdl2_ttf ffmpeg` |
+
+            Voice alerts are configured in `apfpv_sounds.conf` — edit thresholds
+            there, no rebuild needed. Link-quality readout is unavailable on macOS
+            (CoreWLAN exposes no RSSI without Location Services permission) and the
+            PHY rate is unavailable on Linux; both show `--` rather than a made-up
+            value.
+
+            Voice clips are from the EdgeTX sdcard-sounds pack (GPL-2.0); see
+            `NOTICE.md` for attribution.
