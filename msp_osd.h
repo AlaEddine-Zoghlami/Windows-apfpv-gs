@@ -109,7 +109,18 @@ private:
 
 // Feed one MSP_DISPLAYPORT payload (the bytes AFTER the cmd byte, length `len`).
 // Returns true if this payload completed a frame (DP_DRAW), i.e. time to redraw.
-inline bool feedDisplayPort(Canvas& cv, const uint8_t* pl, int len) {
+// Optional tap on WRITE_STRING runs. Each run is ONE OSD element (Betaflight
+// writes "16.2V" as a single string), which is why consumers that want to read
+// VALUES should hook here rather than re-scan the rendered grid: in the grid,
+// adjacent elements abut and a number can be glued to its neighbour, while a run
+// is guaranteed to be one coherent field. The glyph bytes are passed raw because
+// the units are FONT SYMBOLS, not letters (0x06 = volts, 0x07 = mAh), so an
+// ASCII-only view of the canvas would lose exactly the information that says
+// which quantity a number is.
+using DpTextFn = void (*)(int row, int col, const uint8_t* glyphs, int n, void* user);
+struct DpTap { DpTextFn fn = nullptr; void* user = nullptr; };
+
+inline bool feedDisplayPort(Canvas& cv, const uint8_t* pl, int len, const DpTap* tap = nullptr) {
     if (len < 1) return false;
     switch (pl[0]) {
         case DP_CLEAR:
@@ -119,7 +130,10 @@ inline bool feedDisplayPort(Canvas& cv, const uint8_t* pl, int len) {
             // sub, row, col, attr, then glyph indices. Seen live e.g.
             // 03 0f 02 40 96 30 2e 30 32 06 -> row 15, col 2, attr 0x40,
             // glyphs {0x96,'0','.','0','2',0x06} = the battery-voltage field.
-            if (len >= 4) cv.write(pl[1], pl[2], pl[3], pl + 4, len - 4);
+            if (len >= 4) {
+                cv.write(pl[1], pl[2], pl[3], pl + 4, len - 4);
+                if (tap && tap->fn) tap->fn(pl[1], pl[2], pl + 4, len - 4, tap->user);
+            }
             return false;
         case DP_DRAW:
             cv.commit();

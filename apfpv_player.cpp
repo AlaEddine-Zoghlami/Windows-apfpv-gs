@@ -22,7 +22,6 @@ extern "C" {
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <wlanapi.h>
 #else
 #include <unistd.h>
 #include <linux/limits.h>
@@ -45,6 +44,15 @@ extern "C" {
 #include <vector>
 #include <cmath>
 #include "msp_osd.h"
+#include "WifiLink.h"
+#include "SoundEvents.h"
+#include "SoundPlayer.h"
+
+// Wi-Fi link stats come from a per-platform WifiLink implementation
+// (WifiLinkWindows/Linux/Mac/Null.cpp) instead of #ifdefs in this file.
+using apfpv::WifiLink;
+using apfpv::WifiLinkSample;
+using apfpv::makeWifiLink;
 
 #ifdef _WIN32
   #define APFPV_PATH_SEP       "\\"
@@ -696,6 +704,50 @@ static std::string exeDir()
     return s.substr(0, s.find_last_of("\\/"));
 }
 
+// ---------------------------------------------------------------------------
+// Persisted UI toggles (auto-record / ground OSD / overshoot fix).
+//
+// Stored as key=value next to the exe so the player comes back up the way it was left. Kept as a
+// plain text file rather than the registry so it is portable, greppable, and trivially resettable
+// by deleting it. Unknown keys are ignored and a missing/corrupt file simply yields defaults --
+// settings must never be a reason the player fails to start.
+// ---------------------------------------------------------------------------
+struct UiSettings {
+    // Auto-record defaults ON: the common case is wanting the flight captured, and forgetting to
+    // arm it costs you the clip with no way to recover it.
+    bool autoRecord = true;
+    bool osd = true;
+    bool sound = true;
+    bool overshootFix = false;
+
+    static std::string path() { return exeDir() + APFPV_PATH_SEP + "apfpv_settings.ini"; }
+
+    void load() {
+        FILE* f = fopen(path().c_str(), "rb");
+        if (!f) return;                       // first run -- defaults stand
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            char* eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            int v = atoi(eq + 1);
+            if      (!strcmp(line, "auto_record"))   autoRecord   = (v != 0);
+            else if (!strcmp(line, "osd"))           osd          = (v != 0);
+            else if (!strcmp(line, "overshoot_fix")) overshootFix = (v != 0);
+            else if (!strcmp(line, "sound"))         sound        = (v != 0);
+        }
+        fclose(f);
+    }
+
+    void save() const {
+        FILE* f = fopen(path().c_str(), "wb");
+        if (!f) return;                       // read-only install dir: run with defaults, don't fail
+        fprintf(f, "auto_record=%d\nosd=%d\novershoot_fix=%d\n",
+                autoRecord ? 1 : 0, osd ? 1 : 0, overshootFix ? 1 : 0);
+        fclose(f);
+    }
+};
+
 // Records by muxing the SAME compressed packets we're already receiving/
 // decoding, in-process -- NOT by spawning a second ffmpeg pointed at the SDP,
 // which would try to bind UDP 5600 a second time and fail (our own player is
@@ -989,6 +1041,54 @@ struct MspArmWatcher {
     std::thread th;
     std::atomic<bool> run{ false };
     std::atomic<int>  armed{ -1 };      // -1 = unknown (no MSP_STATUS yet), 0 = disarmed, 1 = armed
+    std::atomic<int>  beacon{ -1 };     // same encoding, for the BEACON/beeper box
+
+    // OSD-derived values for the sound events, plus the lock that guards them:
+    // written on this MSP thread, read by the render loop when it evaluates the table.
+    std::mutex          varsMu;
+    apfpv::EventVars    vars;
+
+    /// DpTap callback: one WRITE_STRING run -> at most one variable.
+    static void onOsdRun(int /*row*/, int /*col*/, const uint8_t* g, int n, void* user) {
+        auto* self = static_cast<MspArmWatcher*>(user);
+        std::lock_guard<std::mutex> lk(self->varsMu);
+        apfpv::feedOsdRun(g, n, self->vars);
+    }
+
+    /// Snapshot for the evaluator, with the arm bit folded in.
+    apfpv::EventVars snapshotVars() {
+        std::lock_guard<std::mutex> lk(varsMu);
+        apfpv::EventVars v = vars;
+        int a = armed.load();
+        v.haveArmed = (a >= 0);
+        v.armed = (a == 1);
+        return v;
+    }
+
+    // Which flightModeFlags bit is BEACON -- DISABLED (-1) by default, deliberately.
+    //
+    // Measured on this airframe by sniffing the live MSP with the switch in both positions:
+    //     beacon ON  -> flags 0x00000003  (bits 0,1)
+    //     beacon OFF -> flags 0x00000002  (bit 1)
+    // The only bit that moves is bit 0, which is ARM -- i.e. the beacon switch IS the arm switch,
+    // and no separate beacon flag exists in flightModeFlags. Auto-record's arm trigger therefore
+    // already covers beacon on/off, and defaulting this to Betaflight's nominal BOXBEEPERON (11)
+    // would arm a branch that can never fire while implying beacon is handled separately.
+    //
+    // Kept (rather than deleted) for an FC that does report a distinct beacon box: set
+    //     APFPV_BEACON_BIT=<n>
+    // to enable it. Verify the bit against a live capture first -- a wrong bit here silently
+    // records the wrong window.
+    static int beaconBit() {
+        static const int b = [] {
+            if (const char* e = std::getenv("APFPV_BEACON_BIT")) {
+                int v = std::atoi(e);
+                if (v >= -1 && v < 32) return v;
+            }
+            return -1;
+        }();
+        return b;
+    }
     std::atomic<uint32_t> gen{ 0 };     // bumped on every state CHANGE so the UI loop can see edges
     int port = 14550;
     // The SAME forwarded stream also carries MSP_DISPLAYPORT (cmd 182) -- Betaflight's finished
@@ -1054,7 +1154,11 @@ struct MspArmWatcher {
             // flags read 0x104 while disarmed (bits 2+8; box id 2 is HORIZON, matching the OSD's
             // "HOR" mode field at that moment) -- which confirms this offset and bit numbering.
             if (cmd == 182) {
-                mspospd::feedDisplayPort(osd, &b[ps], plen);
+                // Tap the WRITE_STRING runs so the sound events see OSD VALUES. A run is one
+                // OSD element, and its unit is a font symbol (0x06=volts, ...), which is why
+                // values are read here and not from the rendered grid -- see SoundEvents.h.
+                mspospd::DpTap tap{ &MspArmWatcher::onOsdRun, this };
+                mspospd::feedDisplayPort(osd, &b[ps], plen, &tap);
             }
             if ((cmd == 101 || cmd == 150) && plen >= 10) {
                 uint32_t f = (uint32_t)b[ps + 6] | ((uint32_t)b[ps + 7] << 8)
@@ -1065,6 +1169,20 @@ struct MspArmWatcher {
                     fprintf(stderr, "MSP: %s (flags=0x%08x)\n", now ? "ARMED" : "DISARMED", f);
                     fflush(stderr);
                     gen.fetch_add(1);
+                }
+                // BEACON as a second, independent record trigger. On this airframe it shares
+                // the arm switch, but the two are decoded separately so a beacon-only flip is still
+                // captured and the window stays correct if they are ever split.
+                const int bb = beaconBit();
+                if (bb >= 0) {
+                    int nowB = (f & (1u << bb)) ? 1 : 0;
+                    int prevB = beacon.exchange(nowB);
+                    if (prevB != nowB) {
+                        fprintf(stderr, "MSP: BEACON %s (bit=%d flags=0x%08x)\n",
+                                nowB ? "ON" : "OFF", bb, f);
+                        fflush(stderr);
+                        gen.fetch_add(1);
+                    }
                 }
             }
             i = ps + plen + 1;
@@ -1187,11 +1305,9 @@ struct AalinkStats {
 //  - "up%" is aalink's OWN VTX-side RSSI measurement. It does not exist on the ground, so it stays
 //    "--" until it is forwarded (aalink can emit it with EXTERNAL_OSD=1 -> /tmp/aalink_ext.msg).
 struct LinkStats {
-#ifdef _WIN32
-    HANDLE h = nullptr;
-    GUID guid{};
-    bool haveIface = false;
-#endif
+    // Platform specifics live behind WifiLink (WifiLink.h) rather than in #ifdefs here, so this
+    // struct is identical code on every OS and the player carries no Win32/CoreWLAN types.
+    std::unique_ptr<WifiLink> radio;
     int  rssiDbm = 0;          // 0 = unknown
     unsigned rxRateKbps = 0;   // PHY rate reported by the driver
     long long bytesTotal = 0;  // cumulative received payload
@@ -1199,23 +1315,16 @@ struct LinkStats {
     long long winBytes = 0, winStartMs = 0;
 
     void init() {
-#ifdef _WIN32
-        DWORD neg = 0;
-        if (WlanOpenHandle(2, nullptr, &neg, &h) != ERROR_SUCCESS) { h = nullptr; return; }
-        WLAN_INTERFACE_INFO_LIST* list = nullptr;
-        if (WlanEnumInterfaces(h, nullptr, &list) == ERROR_SUCCESS && list) {
-            // Prefer the USB adapter (the FPV dongle) exactly like lqfeedback_cli does; fall back
-            // to the first interface so this still works on a built-in radio.
-            for (DWORD i = 0; i < list->dwNumberOfItems; i++) {
-                char desc[256] = {0};
-                WideCharToMultiByte(CP_UTF8, 0, list->InterfaceInfo[i].strInterfaceDescription, -1,
-                                    desc, sizeof(desc), nullptr, nullptr);
-                if (strstr(desc, "USB")) { guid = list->InterfaceInfo[i].InterfaceGuid; haveIface = true; break; }
-            }
-            if (!haveIface && list->dwNumberOfItems > 0) { guid = list->InterfaceInfo[0].InterfaceGuid; haveIface = true; }
-            WlanFreeMemory(list);
+        radio = makeWifiLink(/*preferUsb=*/true);   // the FPV dongle, not the built-in card
+        if (radio && !radio->open()) {
+            // Not fatal by contract: video does not depend on link stats, so carry on and let
+            // the UI show "--" rather than refusing to start.
+            fprintf(stderr, "link stats unavailable on this platform/radio\n");
+            radio.reset();
+        } else if (radio) {
+            std::string n = radio->ifaceName();
+            if (!n.empty()) fprintf(stderr, "link stats: reading %s\n", n.c_str());
         }
-#endif
     }
 
     void addBytes(int n) { bytesTotal += n; winBytes += n; }
@@ -1227,20 +1336,14 @@ struct LinkStats {
         if (dt < 1000) return;
         mbps = (double)winBytes * 8.0 / (double)dt / 1000.0;   // bytes/ms -> Mbit/s
         winBytes = 0; winStartMs = nowMsV;
-#ifdef _WIN32
-        if (!h || !haveIface) return;
-        DWORD sz = 0; PVOID data = nullptr;
-        if (WlanQueryInterface(h, &guid, wlan_intf_opcode_rssi, nullptr, &sz, &data, nullptr) == ERROR_SUCCESS && data) {
-            rssiDbm = (int)*(LONG*)data; WlanFreeMemory(data);
-        }
-        sz = 0; data = nullptr;
-        if (WlanQueryInterface(h, &guid, wlan_intf_opcode_current_connection, nullptr, &sz, &data, nullptr) == ERROR_SUCCESS && data) {
-            auto* ca = (WLAN_CONNECTION_ATTRIBUTES*)data;
-            rxRateKbps = ca->wlanAssociationAttributes.ulRxRate;
-            WlanFreeMemory(data);
-        }
-#endif
+        if (!radio) return;
+        WifiLinkSample smp{ rssiDbm, rxRateKbps };   // seed with last known values
+        if (radio->poll(smp)) { rssiDbm = smp.rssiDbm; rxRateKbps = smp.rxRateKbps; }
     }
+
+    /// True when this platform can report a PHY rate at all, so the UI can distinguish
+    /// "unsupported here" from "supported but currently unknown".
+    bool hasRxRate() const { return radio && radio->hasRxRate(); }
 
     // Same mapping LqFeedback uses, so the number shown is exactly what aalink is being told.
     int downPct() const {
@@ -1250,9 +1353,7 @@ struct LinkStats {
     }
 
     void close() {
-#ifdef _WIN32
-        if (h) { WlanCloseHandle(h, nullptr); h = nullptr; }
-#endif
+        if (radio) { radio->close(); radio.reset(); }
     }
 };
 
@@ -1487,8 +1588,10 @@ int main(int argc, char** argv)
     CachedText statLineText, recBtnText, ctBtnText, autoBtnText;
     ColortransLut ctLut;
     ctLut.build(2.5f, -0.15f);
-    bool overshootFixEnabled = false;
-    bool autoRecordEnabled = false;
+    UiSettings uiCfg;
+    uiCfg.load();
+    bool overshootFixEnabled = uiCfg.overshootFix;
+    bool autoRecordEnabled = uiCfg.autoRecord;
     MspArmWatcher msp;
     uint32_t lastArmGen = 0;
     uint32_t lastOsdGenRec = 0xffffffffu;
@@ -1506,8 +1609,28 @@ int main(int argc, char** argv)
         fprintf(stderr, "aalink stats: polling http://%s/aalink_ext.msg\n", vtx.c_str());
     }
     OsdRenderer osdR;
-    bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts");
+    // The saved preference can only ENABLE the OSD if the atlas actually loaded -- init() failing
+    // means there is no font to draw with, and honouring a stale "on" would draw nothing while
+    // reporting ON.
+    bool osdEnabled = osdR.init(ren, dir + APFPV_PATH_SEP + "fonts") && uiCfg.osd;
+    // --- voice alerts (OpenTX-style condition table; see SoundEvents.h) ---
+    apfpv::SoundPlayer soundPlayer;
+    apfpv::SoundEvents soundEvents;
+    bool soundOk = soundPlayer.init(dir + APFPV_PATH_SEP + "sounds");
+    soundPlayer.setEnabled(soundOk && uiCfg.sound);
+    if (soundOk) {
+        soundEvents.setPlayer([](const std::vector<std::string>& clips, void* u) {
+            static_cast<apfpv::SoundPlayer*>(u)->play(clips);
+        }, &soundPlayer);
+        if (!soundEvents.load(dir + APFPV_PATH_SEP + "apfpv_sounds.conf"))
+            fprintf(stderr, "sound: no rules loaded -- alerts disabled\n");
+    }
+    long long lastSoundEvalMs = 0;
+
     SDL_Rect osdBtn{ 12, 180, 160, 60 };
+    // Sound button: top-right, under the Overshoot Fix button (x recomputed per frame).
+    SDL_Rect sndBtn{ 0, 112, 160, 60 };
+    CachedText sndBtnText;
     CachedText osdBtnText;
 
     RecordState rec;
@@ -1532,6 +1655,7 @@ int main(int argc, char** argv)
             int outW, outH;
             SDL_GetRendererOutputSize(ren, &outW, &outH);
             ctBtn.x = outW - ctBtn.w - 12;
+            sndBtn.x = outW - sndBtn.w - 12;
         }
         SDL_Event e;
         STEP(STEP_POLL_EVENTS);
@@ -1559,15 +1683,23 @@ int main(int argc, char** argv)
                 bool ctHit = SDL_PointInRect(&p, &ctBtn);
                 if (ctHit) {
                     overshootFixEnabled = !overshootFixEnabled;
+                    uiCfg.overshootFix = overshootFixEnabled; uiCfg.save();
                     printf("Overshoot Fix -> %s\n", overshootFixEnabled ? "ON" : "OFF");
                     fflush(stdout);
                 }
+                if (SDL_PointInRect(&p, &sndBtn) && soundOk) {
+                    soundPlayer.setEnabled(!soundPlayer.enabled());
+                    uiCfg.sound = soundPlayer.enabled(); uiCfg.save();
+                    printf("Sound -> %s\n", soundPlayer.enabled() ? "ON" : "OFF"); fflush(stdout);
+                }
                 if (SDL_PointInRect(&p, &osdBtn) && osdR.ready) {
                     osdEnabled = !osdEnabled;
+                    uiCfg.osd = osdEnabled; uiCfg.save();
                     printf("Ground OSD -> %s\n", osdEnabled ? "ON" : "OFF"); fflush(stdout);
                 }
                 if (SDL_PointInRect(&p, &autoBtn)) {
                     autoRecordEnabled = !autoRecordEnabled;
+                    uiCfg.autoRecord = autoRecordEnabled; uiCfg.save();
                     if (autoRecordEnabled) lastArmGen = msp.gen.load();   // don't fire on stale state
                     printf("Auto record (on arm) -> %s%s\n", autoRecordEnabled ? "ON" : "OFF",
                            autoRecordEnabled ? "  [needs msposd -d -o <thisPC>:14550 on the VTX]" : "");
@@ -1597,9 +1729,13 @@ int main(int argc, char** argv)
             uint32_t g = msp.gen.load();
             if (g != lastArmGen) {
                 lastArmGen = g;
-                bool nowArmed = msp.armed.load() == 1;
-                if (nowArmed && !rec.recording)      startRecording(rec, dir, fmt, videoStream);
-                else if (!nowArmed && rec.recording) stopRecording(rec, overshootFixEnabled, osdEnabled);
+                // Record while EITHER arm or beacon is asserted; stop only once BOTH are clear.
+                // OR-ing means a beacon-only flip is still captured; requiring both to clear means a
+                // shared switch cannot stop the recording early if the two bits drop in different
+                // MSP frames.
+                bool trigger = (msp.armed.load() == 1) || (msp.beacon.load() == 1);
+                if (trigger && !rec.recording)       startRecording(rec, dir, fmt, videoStream);
+                else if (!trigger && rec.recording)  stopRecording(rec, overshootFixEnabled, osdEnabled);
             }
         }
 
@@ -1849,13 +1985,50 @@ int main(int argc, char** argv)
         }
         drawTextCached(ren, font, statLineText, statLine, 12, 10, SDL_Color{ 255, 255, 255, 255 });
 
+        // Voice alerts: evaluate the condition table at ~2 Hz. Cheap (a handful of
+        // comparisons) and fast enough that an alert lands within half a second of the
+        // condition changing, while never being tied to frame rate.
+        if (soundOk && nowMs() - lastSoundEvalMs >= 500) {
+            lastSoundEvalMs = nowMs();
+            soundEvents.evaluate(msp.snapshotVars(), lastSoundEvalMs);
+        }
+
         STEP(STEP_DRAW_BUTTON);
         SDL_SetRenderDrawColor(ren, rec.recording ? 200 : 60, rec.recording ? 30 : 60, 30, 220);
         SDL_RenderFillRect(ren, &recBtn);
         SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
         SDL_RenderDrawRect(ren, &recBtn);
-        drawTextCached(ren, font, recBtnText, rec.recording ? "REC ||" : "REC", recBtn.x + 20, recBtn.y + 18,
+        // While recording, the button doubles as the elapsed-time readout. Sourced from the
+        // session's existing wall-clock startMs rather than a second timer, so it cannot drift
+        // from the file being written. drawTextCached re-rasterises only when the string changes,
+        // i.e. once a second here, not every frame.
+        char recLabel[32];
+        if (rec.recording && rec.session) {
+            long long el = (nowMs() - rec.session->startMs) / 1000;
+            if (el < 0) el = 0;                       // clock skew guard
+            if (el >= 3600)
+                snprintf(recLabel, sizeof(recLabel), "%lld:%02lld:%02lld",
+                         el / 3600, (el / 60) % 60, el % 60);
+            else
+                snprintf(recLabel, sizeof(recLabel), "REC %lld:%02lld", el / 60, el % 60);
+        } else {
+            snprintf(recLabel, sizeof(recLabel), "REC");
+        }
+        drawTextCached(ren, font, recBtnText, recLabel, recBtn.x + (rec.recording ? 12 : 20), recBtn.y + 18,
                        SDL_Color{ 255, 255, 255, 255 });
+
+        // Sound toggle (top-right, under O.FIX). Greyed out when no audio device or no
+        // rules loaded, so the button reflects capability rather than lying about state.
+        {
+            bool on = soundOk && soundPlayer.enabled();
+            SDL_SetRenderDrawColor(ren, on ? 30 : 60, on ? 120 : 60, on ? 160 : 60, 220);
+            SDL_RenderFillRect(ren, &sndBtn);
+            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+            SDL_RenderDrawRect(ren, &sndBtn);
+            drawTextCached(ren, font, sndBtnText,
+                           !soundOk ? "SND N/A" : (on ? "SND ON" : "SND OFF"),
+                           sndBtn.x + 20, sndBtn.y + 18, SDL_Color{ 255, 255, 255, 255 });
+        }
 
         SDL_SetRenderDrawColor(ren, overshootFixEnabled ? 30 : 60, overshootFixEnabled ? 160 : 60, 60, 220);
         SDL_RenderFillRect(ren, &ctBtn);
@@ -1894,6 +2067,7 @@ int main(int argc, char** argv)
     }
 
     aalink.stop();
+    soundPlayer.shutdown();
     link.close();
     osdR.destroy();
     msp.stop();   // join the MSP listener before we start tearing down
