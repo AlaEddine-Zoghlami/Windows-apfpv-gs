@@ -1245,6 +1245,8 @@ struct AalinkStats {
     std::thread th;
     std::atomic<bool> run{ false };
     std::atomic<int> up{ -1 }, down{ -1 }, mcs{ -1 }, kbps{ -1 }, bw{ -1 }, ch{ -1 }, txpwr{ -1 }, q{ -1 };
+    // Real streamed fps (venc Fps_1s) + SoC temperature °C — appended by the VTX aalink_udp relay.
+    std::atomic<int> fps{ -1 }, tempC{ -1 };
     std::atomic<long long> lastOkMs{ 0 };
     std::string url;
 
@@ -1330,6 +1332,7 @@ struct AalinkStats {
         grab("mcs", mcs);         grab("target_kbps", kbps);
         grab("width_mhz", bw);    grab("channel", ch);
         grab("txpwr_dbm", txpwr); grab("q", q);
+        grab("fps", fps);         grab("temp_c", tempC);
     }
 
     bool fresh() const { return lastOkMs.load() != 0 && (nowMs() - lastOkMs.load()) < 5000; }
@@ -2026,10 +2029,18 @@ int main(int argc, char** argv)
             char sentBuf[24];
             if (gb >= 1.0) snprintf(sentBuf, sizeof(sentBuf), "%.2fGB", gb);
             else           snprintf(sentBuf, sizeof(sentBuf), "%.0fMB", (double)link.bytesTotal / (1024.0 * 1024.0));
+            // Channel + SoC temperature come from aalink (air-side); format the channel like the
+            // old VTX OSD ("Ch:40-20mhz"). Empty when aalink is stale.
+            char chBuf[24] = "";
+            if (aOk && aalink.ch.load() > 0)
+                snprintf(chBuf, sizeof(chBuf), " | Ch:%d-%dmhz", aalink.ch.load(), aalink.bw.load());
+            char tBuf[16] = "";
+            if (aOk && aalink.tempC.load() >= 0)
+                snprintf(tBuf, sizeof(tBuf), " | %dC", aalink.tempC.load());
             // Mirrors the old VTX line's fields, but every number here is measured at the receiver.
             snprintf(statLine, sizeof(statLine),
-                     "%dx%d %.1ffps | %.1fMbps | %s | MCS:%s %sM | up:%s dn:%s",
-                     texW, texH, fps, link.mbps, sentBuf, mcsBuf, rateBuf, upBuf, dnBuf);
+                     "%dx%d %.1ffps | %.1fMbps | %s | MCS:%s %sM | up:%s dn:%s%s%s",
+                     texW, texH, fps, link.mbps, sentBuf, mcsBuf, rateBuf, upBuf, dnBuf, chBuf, tBuf);
         }
         drawTextCached(ren, font, statLineText, statLine, 12, 10, SDL_Color{ 255, 255, 255, 255 });
 
